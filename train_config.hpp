@@ -28,13 +28,13 @@ struct Config {
     std::string preview_out = "previews/iter"; // output prefix for training previews
     std::string save_ply   = "";           // write latest checkpoint PLY to this path
     int         save_ply_every = 0;        // 0 = only save final checkpoint
-    int         densify_every = 50;        // 0 = off
-    int         densify_start = 250;
+    int         densify_every = 100;       // 0 = off
+    int         densify_start = 500;
     int         densify_stop  = 15000;
     int         opacity_reset_every = 3000;
-    float       densify_grad_thresh = 0.0f;     // 0 = use adaptive mean-grad heuristic
-    float       densify_grad_mult   = 1.5f;     // adaptive threshold = mean_grad * this
-    float       densify_prune_alpha = 0.05f;    // 2DGS / gsplat simple_trainer_2dgs default
+    float       densify_grad_thresh = 0.0002f;  // 0 = use adaptive mean-grad heuristic; matches gsplat default
+    float       densify_grad_mult   = 1.5f;     // adaptive threshold = mean_grad * this (used when grad_thresh == 0)
+    float       densify_prune_alpha = 0.005f;   // matches gsplat DefaultStrategy
     float       densify_grow_scale3d = 0.01f;   // normalized by scene scale
     float       densify_prune_scale3d = 0.10f;  // normalized by scene scale
     int         max_gaussians = 2000000;        // hard cap: skip densify once N exceeds this
