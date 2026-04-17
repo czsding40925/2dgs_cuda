@@ -1,0 +1,75 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "train (CUDA debug)",
+            "type": "cuda-gdb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/train_debug",
+            "args": [
+                "--data", "data/360_v2/garden",
+                "--images", "images_4",
+                "--iters", "1000",
+                "--log-every", "1",
+                "--save-ply", "${workspaceFolder}/checkpoints/garden_latest.ply",
+                "--save-ply-every", "50",
+                "--densify-start", "250",
+                "--densify-every", "50",
+                "--densify-stop", "15000",
+                "--opacity-reset-every", "3000",
+                "--densify-prune-alpha", "0.05",
+                "--densify-grow-scale3d", "0.01",
+                "--densify-prune-scale3d", "0.1"
+            ],
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": false,
+            "preLaunchTask": "build train_debug",
+            "initCommands": ["-enable-pretty-printing"]
+        },
+        {
+            "name": "viewer (Rendered Python)",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/python/viser_splat_viewer.py",
+            "args": [
+                "--ply", "${workspaceFolder}/checkpoints/garden_latest.ply",
+                "--port", "8080",
+                "--resolution", "1024"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "viewer (Point Cloud Python)",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/python/viser_point_cloud_viewer.py",
+            "args": [
+                "--ply", "${workspaceFolder}/checkpoints/garden_latest.ply",
+                "--port", "8080",
+                "--poll-seconds", "2.0"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "rasterize_fwd (CUDA debug)",
+            "type": "cuda-gdb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/rasterize_fwd_debug",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": false,
+            "preLaunchTask": "build rasterize_fwd_debug",
+            "initCommands": ["-enable-pretty-printing"]
+        },
+        {
+            "name": "CUDA Debug (quat_to_rotmat)",
+            "type": "cuda-gdb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/quat_to_rotmat_debug",
+            "args": [],
+            "stopAtEntry": true
+        }
+    ]
+}

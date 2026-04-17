@@ -1,0 +1,20 @@
+# Build artifacts
+build/
+
+# Training outputs (large binary files)
+checkpoints/
+splats/
+previews/
+
+# Dataset symlink / raw data
+data
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+*.swp
+*~
+.DS_Store

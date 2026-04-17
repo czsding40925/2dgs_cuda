@@ -1,0 +1,33 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build rasterize_fwd_debug",
+            "type": "shell",
+            "command": "make build/rasterize_fwd_debug",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "build",
+            "presentation": {
+                "reveal": "silent",
+                "panel": "shared"
+            },
+            "problemMatcher": "$nvcc"
+        },
+        {
+            "label": "build train_debug",
+            "type": "shell",
+            "command": "make build/train_debug",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "build",
+            "presentation": {
+                "reveal": "silent",
+                "panel": "shared"
+            },
+            "problemMatcher": "$nvcc"
+        }
+    ]
+}
