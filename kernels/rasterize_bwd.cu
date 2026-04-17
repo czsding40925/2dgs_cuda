@@ -204,13 +204,17 @@ __global__ void rasterize_bwd_kernel(
 
             float u = zeta.x / zeta.z;
             float v = zeta.y / zeta.z;
-            float depth = u * wM.x + v * wM.y + wM.z;
-            if (depth < BWD_RASTER_NEAR_PLANE) continue;
 
             float gauss_3d = u*u + v*v;
             float dx = xyo.x - px, dy = xyo.y - py_f;
             float gauss_2d = BWD_FILTER_INV_SQ * (dx*dx + dy*dy);
+            bool use_3d = (gauss_3d <= gauss_2d);
             float sigma = 0.5f * fminf(gauss_3d, gauss_2d);
+
+            // Depth matches fwd: intersection formula only when 3D kernel wins,
+            // otherwise splat center depth (wM.z).
+            float depth = use_3d ? (u * wM.x + v * wM.y + wM.z) : wM.z;
+            if (depth < BWD_RASTER_NEAR_PLANE) continue;
             if (sigma < 0.f) continue;
 
             float vis   = __expf(-sigma);
@@ -292,14 +296,18 @@ __global__ void rasterize_bwd_kernel(
             float v_wM0=0, v_wM1=0, v_wM2=0;
             float v_xy0=0, v_xy1=0;
             float v_xyabs0=0, v_xyabs1=0;
-            float v_s_x = v_depth * wM.x;
-            float v_s_y = v_depth * wM.y;
-            float v_w_extra0 = v_depth * u;
-            float v_w_extra1 = v_depth * v;
+            // Depth-gradient flow differs by kernel branch. In the 3D case
+            // depth = u*wM.x + v*wM.y + wM.z, so gradients go to (u,v) and
+            // all three components of wM. In the 2D case depth = wM.z, so
+            // only wM.z receives the depth gradient.
+            float v_s_x = use_3d ? (v_depth * wM.x) : 0.f;
+            float v_s_y = use_3d ? (v_depth * wM.y) : 0.f;
+            float v_w_extra0 = use_3d ? (v_depth * u) : 0.f;
+            float v_w_extra1 = use_3d ? (v_depth * v) : 0.f;
             float v_w_extra2 = v_depth;
 
             if (opac * vis <= 0.999f) {
-                if (gauss_3d <= gauss_2d) {
+                if (use_3d) {
                     // Case 1: 3D kernel — backprop through ray-splat intersection
                     // vis = exp(-0.5*(u²+v²))   d(vis)/d(u) = -vis*u
                     v_s_x += v_G * (-vis) * u;

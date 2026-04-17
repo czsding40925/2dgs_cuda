@@ -188,14 +188,21 @@ __global__ void rasterize_fwd_kernel(
 
             float u = zeta.x / zeta.z;
             float v = zeta.y / zeta.z;
-            float depth = u * w_M.x + v * w_M.y + w_M.z;
-            if (depth < RASTER_NEAR_PLANE) continue;
 
             // Merge 3D Gaussian kernel with 2D screen falloff (anti-aliasing)
             float gauss_3d = u*u + v*v;
             float dx = xyo.x - px, dy = xyo.y - py_f;
             float gauss_2d = FILTER_INV_SQ * (dx*dx + dy*dy);
             float sigma = 0.5f * fminf(gauss_3d, gauss_2d);
+
+            // Depth: ray-plane intersection when 3D kernel dominates; splat
+            // center depth otherwise. Using the intersection formula in the
+            // 2D-filter case gives spurious (often negative) depth for edge-on
+            // splats, which the near-plane cull then incorrectly kills.
+            float depth = (gauss_3d <= gauss_2d)
+                          ? (u * w_M.x + v * w_M.y + w_M.z)
+                          : w_M.z;
+            if (depth < RASTER_NEAR_PLANE) continue;
 
             if (sigma < 0.f) continue;
             float alpha = fminf(0.999f, xyo.z * __expf(-sigma));
