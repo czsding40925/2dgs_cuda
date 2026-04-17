@@ -1630,21 +1630,19 @@ int main(int argc, char** argv) {
         printf("Loading COLMAP scene from: %s\n", cfg.data_dir.c_str());
         try {
             scene = load_colmap(cfg.data_dir, cfg.images);
+            if (needs_training_images) {
+                training_images = prepare_training_images(
+                    scene, cfg.images, /*cache_pixels=*/true);
+            } else {
+                // Render/orbit paths need the same intrinsics rescaling as training
+                // when using downsampled image folders such as images_2 or images_4.
+                prepare_training_images(scene, cfg.images, /*cache_pixels=*/false);
+            }
         } catch (const std::exception& e) {
-            fprintf(stderr, "Error loading scene: %s\n", e.what());
+            fprintf(stderr, "Error preparing scene/images: %s\n", e.what());
             return 1;
         }
         print_scene_summary(scene);
-    }
-
-    if (needs_training_images) {
-        const bool cache_training_images = true;
-        try {
-            training_images = prepare_training_images(scene, cfg.images, cache_training_images);
-        } catch (const std::exception& e) {
-            fprintf(stderr, "Error preparing images: %s\n", e.what());
-            return 1;
-        }
     }
 
     SplatData splats(0, cfg.sh_degree);
