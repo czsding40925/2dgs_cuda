@@ -60,7 +60,7 @@ __global__ void adam_step_kernel(
 struct AdamConfig {
     float beta1 = 0.9f;
     float beta2 = 0.999f;
-    float eps = 1e-8f;
+    float eps = 1e-15f;  // matches gsplat/PyTorch 3DGS convention; 1e-8 over-damps updates
     bool  bias_correction = true;
 
     // Per-parameter-group learning rates. These match the usual 3DGS ordering:
