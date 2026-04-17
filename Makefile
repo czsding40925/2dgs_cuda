@@ -74,10 +74,10 @@ run-projection-bwd: $(BIN_DIR)/projection_2dgs_bwd
 run-gradcheck: $(BIN_DIR)/gradient_checks
 	./$(BIN_DIR)/gradient_checks
 
-$(BIN_DIR)/train: train.cu kernels/colmap_reader.hpp kernels/splat_data.cuh kernels/simple_knn.cuh kernels/adam.cu kernels/loss.cu kernels/rasterize_fwd.cu kernels/rasterize_bwd.cu kernels/projection_2dgs.cu kernels/projection_2dgs_bwd.cu kernels/intersect_tile.cu ../LichtFeld-Studio/external/stb_image.h | $(BIN_DIR)
+$(BIN_DIR)/train: train.cu kernels/colmap_reader.hpp kernels/splat_data.cuh kernels/simple_knn.cuh kernels/adam.cu kernels/loss.cu kernels/rasterize_fwd.cu kernels/rasterize_bwd.cu kernels/projection_2dgs.cu kernels/projection_2dgs_bwd.cu kernels/intersect_tile.cu external/stb_image.h external/stb_image_write.h | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
-$(BIN_DIR)/train_debug: train.cu kernels/colmap_reader.hpp kernels/splat_data.cuh kernels/simple_knn.cuh kernels/adam.cu kernels/loss.cu kernels/rasterize_fwd.cu kernels/rasterize_bwd.cu kernels/projection_2dgs.cu kernels/projection_2dgs_bwd.cu kernels/intersect_tile.cu ../LichtFeld-Studio/external/stb_image.h | $(BIN_DIR)
+$(BIN_DIR)/train_debug: train.cu kernels/colmap_reader.hpp kernels/splat_data.cuh kernels/simple_knn.cuh kernels/adam.cu kernels/loss.cu kernels/rasterize_fwd.cu kernels/rasterize_bwd.cu kernels/projection_2dgs.cu kernels/projection_2dgs_bwd.cu kernels/intersect_tile.cu external/stb_image.h external/stb_image_write.h | $(BIN_DIR)
 	$(NVCC) $(DEBUGFLAGS) -o $@ $<
 
 run-train: $(BIN_DIR)/train

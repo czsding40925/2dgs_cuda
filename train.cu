@@ -52,9 +52,9 @@
 #include <vector>
 
 #define STB_IMAGE_IMPLEMENTATION
-#include "../LichtFeld-Studio/external/stb_image.h"
+#include "external/stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "../LichtFeld-Studio/external/stb_image_write.h"
+#include "external/stb_image_write.h"
 
 // ---------------------------------------------------------------------------
 // CLI parsing  →  train_config.hpp
