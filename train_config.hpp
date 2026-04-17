@@ -32,8 +32,8 @@ struct Config {
     int         densify_start = 500;
     int         densify_stop  = 15000;
     int         opacity_reset_every = 3000;
-    float       densify_grad_thresh = 0.0002f;  // 0 = use adaptive mean-grad heuristic; matches gsplat default
-    float       densify_grad_mult   = 1.5f;     // adaptive threshold = mean_grad * this (used when grad_thresh == 0)
+    float       densify_grad_thresh = 0.0f;     // 0 = use adaptive mean-grad heuristic (recommended; fixed values don't transfer across scenes)
+    float       densify_grad_mult   = 2.0f;     // adaptive threshold = mean_grad * this; ~top 30% of Gaussians by gradient
     float       densify_prune_alpha = 0.005f;   // matches gsplat DefaultStrategy
     float       densify_grow_scale3d = 0.01f;   // normalized by scene scale
     float       densify_prune_scale3d = 0.10f;  // normalized by scene scale
