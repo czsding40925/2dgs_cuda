@@ -90,10 +90,10 @@ static void print_training_progress(
     int eta_m = (int)(eta_sec / 60.0);
     int eta_s = (int)eta_sec % 60;
 
-    printf("\r[%s] %5d/%d  sh=%d/%d  loss=%.5f  l1=%.5f  dssim=%.5f  isects=%d  %.2fit/s  eta=%02d:%02d",
+    printf("\r[%s] %5d/%d  sh=%d/%d  loss=%.5f  l1=%.5f  dssim=%.5f  dist=%.5f  norm=%.5f  isects=%d  %.2fit/s  eta=%02d:%02d",
            bar, iter, iters,
            sh_active, sh_max,
-           loss.loss, loss.loss_l1, loss.loss_dssim,
+           loss.loss, loss.loss_l1, loss.loss_dssim, loss.loss_distort, loss.loss_normal,
            n_isects, iter_per_sec, eta_m, eta_s);
     if (final_line) printf("\n");
     fflush(stdout);
@@ -722,10 +722,17 @@ struct ForwardBuffers {
     // Rasterizer outputs (one per pixel at max resolution)
     float*   render_colors;   // [H*W, 3]
     float*   render_alphas;   // [H*W]
+    float*   render_normals;  // [H*W, 3]
+    float*   render_depth_accum; // [H*W]
+    float*   render_distort;  // [H*W]
     int32_t* last_ids;        // [H*W]
     unsigned char* target_rgb_u8; // [H*W, 3]  staging upload buffer
     float*   target_colors;   // [H*W, 3]  ground-truth RGB
     float*   grad_render;     // [H*W, 3]  dL/d(render_colors)
+    float*   grad_render_alphas; // [H*W]  dL/d(render_alphas)
+    float*   grad_render_normals; // [H*W, 3]
+    float*   grad_render_depth_accum; // [H*W]
+    float*   grad_render_distort; // [H*W]
 
     // Camera pose (uploaded each frame)
     float*   viewmat;         // [16]  world→camera, row-major
@@ -734,6 +741,7 @@ struct ForwardBuffers {
     float*   grad_ray_transforms; // [N, 9]
     float*   grad_opacity;        // [N]
     float*   grad_colors;         // [N, 3]
+    float*   grad_normals;        // [N, 3]
     float*   grad_means2d;        // [N, 2]
     float*   grad_means2d_abs;    // [N, 2]
     float*   grad_means;          // [N, 3]
@@ -758,14 +766,22 @@ static ForwardBuffers alloc_forward_buffers(int N, int max_pixels, int max_sh_de
     CUDA_CHECK(cudaMalloc(&b.colors,         N * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.render_colors,  max_pixels * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.render_alphas,  max_pixels     * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&b.render_normals, max_pixels * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&b.render_depth_accum, max_pixels * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&b.render_distort, max_pixels * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.last_ids,       max_pixels     * sizeof(int32_t)));
     CUDA_CHECK(cudaMalloc(&b.target_rgb_u8,  max_pixels * 3 * sizeof(unsigned char)));
     CUDA_CHECK(cudaMalloc(&b.target_colors,  max_pixels * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.grad_render,    max_pixels * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&b.grad_render_alphas, max_pixels * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&b.grad_render_normals, max_pixels * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&b.grad_render_depth_accum, max_pixels * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&b.grad_render_distort, max_pixels * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.viewmat,        16             * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.grad_ray_transforms, N * 9 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.grad_opacity,        N     * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.grad_colors,         N * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&b.grad_normals,        N * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.grad_means2d,        N * 2 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.grad_means2d_abs,    N * 2 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.grad_means,          N * 3 * sizeof(float)));
@@ -783,10 +799,14 @@ static ForwardBuffers alloc_forward_buffers(int N, int max_pixels, int max_sh_de
 static void free_forward_buffers(ForwardBuffers& b) {
     cudaFree(b.ray_transforms); cudaFree(b.means2d); cudaFree(b.radii);
     cudaFree(b.depths);         cudaFree(b.normals);  cudaFree(b.colors);
-    cudaFree(b.render_colors);  cudaFree(b.render_alphas); cudaFree(b.last_ids);
+    cudaFree(b.render_colors);  cudaFree(b.render_alphas); cudaFree(b.render_normals);
+    cudaFree(b.render_depth_accum); cudaFree(b.render_distort); cudaFree(b.last_ids);
     cudaFree(b.target_rgb_u8);  cudaFree(b.target_colors);  cudaFree(b.grad_render);
+    cudaFree(b.grad_render_alphas); cudaFree(b.grad_render_normals);
+    cudaFree(b.grad_render_depth_accum); cudaFree(b.grad_render_distort);
     cudaFree(b.viewmat);
     cudaFree(b.grad_ray_transforms); cudaFree(b.grad_opacity); cudaFree(b.grad_colors);
+    cudaFree(b.grad_normals);
     cudaFree(b.grad_means2d); cudaFree(b.grad_means2d_abs);
     cudaFree(b.grad_means); cudaFree(b.grad_rotation); cudaFree(b.grad_scaling);
     cudaFree(b.grad_sh0); cudaFree(b.grad_shN);
@@ -924,10 +944,12 @@ static bool render_camera_to_file(
     CUDA_CHECK(cudaMemset(fwd.render_colors, 0, W * H * 3 * sizeof(float)));
     CUDA_CHECK(cudaMemset(fwd.render_alphas, 0, W * H * sizeof(float)));
     launch_rasterize_fwd(
-        fwd.means2d, fwd.ray_transforms, splats.opacity(), fwd.colors,
+        fwd.means2d, fwd.ray_transforms, splats.opacity(), fwd.colors, fwd.normals,
         tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
         W, H,
-        fwd.render_colors, fwd.render_alphas, fwd.last_ids
+        fwd.render_colors, fwd.render_alphas,
+        nullptr, nullptr, nullptr,
+        fwd.last_ids
     );
 
     bool ok = save_device_rgb_png(fwd.render_colors, W, H, out_path);
@@ -1252,9 +1274,10 @@ static void render_orbit(const Config& cfg, SplatData& splats,
         CUDA_CHECK(cudaMemset(fwd.render_colors, 0, W*H*3*sizeof(float)));
         CUDA_CHECK(cudaMemset(fwd.render_alphas, 0, W*H*sizeof(float)));
         launch_rasterize_fwd(
-            fwd.means2d, fwd.ray_transforms, splats.opacity(), fwd.colors,
+            fwd.means2d, fwd.ray_transforms, splats.opacity(), fwd.colors, fwd.normals,
             tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
-            W, H, fwd.render_colors, fwd.render_alphas, fwd.last_ids);
+            W, H, fwd.render_colors, fwd.render_alphas,
+            nullptr, nullptr, nullptr, fwd.last_ids);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         free_tile_intersect_buffers(tile_buf);
@@ -1327,10 +1350,15 @@ static void train(
                cfg.opacity_reset_every, cfg.densify_prune_alpha,
                cfg.densify_grow_scale3d, cfg.densify_prune_scale3d,
                cfg.densify_grad_thresh);
+    printf("Reg losses  : dist=%.3g@%d  normal=%.3g@%d\n",
+           cfg.dist_lambda, cfg.dist_start_iter,
+           cfg.normal_lambda, cfg.normal_start_iter);
 
     ForwardBuffers fwd = alloc_forward_buffers(splats.N(), max_W * max_H, splats.max_sh_degree());
     LossWorkspace loss_ws{};
     ensure_loss_workspace(loss_ws, (int)max_W * (int)max_H * 3);
+    GeometryLossWorkspace geom_ws{};
+    ensure_geometry_loss_workspace(geom_ws, (int)max_W * (int)max_H);
     DensifyState densify{};
     alloc_densify_state(densify, splats.N());
     SplatAdam optimizer(splats);
@@ -1419,22 +1447,51 @@ static void train(
         // ── Step 3: Rasterize ─────────────────────────────────────────────────
         CUDA_CHECK(cudaMemset(fwd.render_colors, 0, W*H*3*sizeof(float)));
         CUDA_CHECK(cudaMemset(fwd.render_alphas, 0, W*H*sizeof(float)));
+        CUDA_CHECK(cudaMemset(fwd.render_normals, 0, W*H*3*sizeof(float)));
+        CUDA_CHECK(cudaMemset(fwd.render_depth_accum, 0, W*H*sizeof(float)));
+        CUDA_CHECK(cudaMemset(fwd.render_distort, 0, W*H*sizeof(float)));
 
         launch_rasterize_fwd(
-            fwd.means2d, fwd.ray_transforms, splats.opacity(), fwd.colors,
+            fwd.means2d, fwd.ray_transforms, splats.opacity(), fwd.colors, fwd.normals,
             tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
             W, H,
-            fwd.render_colors, fwd.render_alphas, fwd.last_ids
+            fwd.render_colors, fwd.render_alphas, fwd.render_normals,
+            fwd.render_depth_accum, fwd.render_distort, fwd.last_ids
         );
 
         LossResult loss = photometric_loss(
             fwd.render_colors, fwd.target_colors, fwd.grad_render, loss_ws,
             (int)H, (int)W, 0.2f, 3);
+        CUDA_CHECK(cudaMemset(fwd.grad_render_alphas, 0, W*H*sizeof(float)));
+        CUDA_CHECK(cudaMemset(fwd.grad_render_normals, 0, W*H*3*sizeof(float)));
+        CUDA_CHECK(cudaMemset(fwd.grad_render_depth_accum, 0, W*H*sizeof(float)));
+        CUDA_CHECK(cudaMemset(fwd.grad_render_distort, 0, W*H*sizeof(float)));
+
+        const float dist_lambda =
+            (iter > cfg.dist_start_iter) ? cfg.dist_lambda : 0.f;
+        const float normal_lambda =
+            (iter > cfg.normal_start_iter) ? cfg.normal_lambda : 0.f;
+        if (dist_lambda > 0.f || normal_lambda > 0.f) {
+            GeometryLossResult geom = geometry_loss_2dgs(
+                fwd.render_depth_accum, fwd.render_alphas,
+                fwd.render_normals, fwd.render_distort,
+                fwd.grad_render_depth_accum, fwd.grad_render_alphas,
+                fwd.grad_render_normals, fwd.grad_render_distort,
+                geom_ws,
+                (int)H, (int)W,
+                cam.K.fx, cam.K.fy, cam.K.cx, cam.K.cy,
+                normal_lambda, dist_lambda
+            );
+            loss.loss += geom.loss_total;
+            loss.loss_distort = geom.loss_distort;
+            loss.loss_normal = geom.loss_normal;
+        }
 
         // ── Backward pass ────────────────────────────────────────────────────
         CUDA_CHECK(cudaMemset(fwd.grad_ray_transforms, 0, N*9*sizeof(float)));
         CUDA_CHECK(cudaMemset(fwd.grad_opacity,        0, N*sizeof(float)));
         CUDA_CHECK(cudaMemset(fwd.grad_colors,         0, N*3*sizeof(float)));
+        CUDA_CHECK(cudaMemset(fwd.grad_normals,        0, N*3*sizeof(float)));
         CUDA_CHECK(cudaMemset(fwd.grad_means2d,        0, N*2*sizeof(float)));
         CUDA_CHECK(cudaMemset(fwd.grad_means2d_abs,    0, N*2*sizeof(float)));
         CUDA_CHECK(cudaMemset(fwd.grad_means,          0, N*3*sizeof(float)));
@@ -1445,11 +1502,14 @@ static void train(
             CUDA_CHECK(cudaMemset(fwd.grad_shN, 0, fwd.shN_numel*sizeof(float)));
 
         launch_rasterize_bwd(
-            fwd.means2d, fwd.ray_transforms, splats.opacity(), fwd.colors,
+            fwd.means2d, fwd.ray_transforms, splats.opacity(), fwd.colors, fwd.normals,
             tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
-            fwd.render_alphas, fwd.last_ids, fwd.grad_render,
+            fwd.render_alphas, fwd.render_depth_accum, fwd.last_ids,
+            fwd.grad_render, fwd.grad_render_alphas,
+            fwd.grad_render_normals, fwd.grad_render_depth_accum,
+            fwd.grad_render_distort,
             W, H,
-            fwd.grad_ray_transforms, fwd.grad_opacity, fwd.grad_colors,
+            fwd.grad_ray_transforms, fwd.grad_opacity, fwd.grad_colors, fwd.grad_normals,
             fwd.grad_means2d, fwd.grad_means2d_abs
         );
 
@@ -1458,7 +1518,7 @@ static void train(
             cam.K.fx, cam.K.fy, cam.K.cx, cam.K.cy,
             fwd.ray_transforms, fwd.radii,
             fwd.grad_ray_transforms, fwd.grad_means2d,
-            /*d_v_depths=*/nullptr, /*d_v_normals=*/nullptr,
+            /*d_v_depths=*/nullptr, fwd.grad_normals,
             fwd.grad_means, fwd.grad_rotation, fwd.grad_scaling,
             N
         );
@@ -1543,6 +1603,7 @@ static void train(
 
     free_forward_buffers(fwd);
     free_loss_workspace(loss_ws);
+    free_geometry_loss_workspace(geom_ws);
     free_densify_state(densify);
 }
 

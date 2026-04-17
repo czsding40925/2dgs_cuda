@@ -17,6 +17,7 @@
 #include "rasterize_fwd.cu"
 #include "rasterize_bwd.cu"
 #include "projection_2dgs_bwd.cu"
+#include "loss.cu"
 #undef INCLUDED_AS_HEADER
 
 #include <algorithm>
@@ -200,6 +201,82 @@ static float centered_diff(std::vector<float>& params, int idx, float eps, const
     return (fp - fm) / (2.f * eps);
 }
 
+struct RasterSceneData {
+    std::vector<float> means2d;
+    std::vector<float> T;
+    std::vector<float> depths;
+    std::vector<float> normals;
+    std::vector<int32_t> radii;
+};
+
+static RasterSceneData make_overlapping_raster_scene(
+    uint32_t W, uint32_t H,
+    float fx, float fy, float cx, float cy)
+{
+    const int N = 2;
+    std::vector<float> h_means = {
+         0.00f,  0.00f, 2.00f,
+         0.05f, -0.03f, 2.25f
+    };
+    std::vector<float> h_rotation = {
+        1.f, 0.f, 0.f, 0.f,
+        1.f, 0.f, 0.f, 0.f
+    };
+    std::vector<float> h_scaling = {
+        -1.95f, -1.95f, 0.f,
+        -2.05f, -2.05f, 0.f
+    };
+    std::vector<float> h_viewmat = {
+        1,0,0,0,
+        0,1,0,0,
+        0,0,1,0,
+        0,0,0,1
+    };
+
+    float *d_means, *d_rotation, *d_scaling, *d_viewmat;
+    float *d_T, *d_means2d, *d_depths, *d_normals;
+    int32_t* d_radii;
+    CUDA_CHECK(cudaMalloc(&d_means, N * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_rotation, N * 4 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_scaling, N * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_viewmat, 16 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_T, N * 9 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_means2d, N * 2 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_depths, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_normals, N * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_radii, N * 2 * sizeof(int32_t)));
+
+    CUDA_CHECK(cudaMemcpy(d_means, h_means.data(), N * 3 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_rotation, h_rotation.data(), N * 4 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_scaling, h_scaling.data(), N * 3 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_viewmat, h_viewmat.data(), 16 * sizeof(float), cudaMemcpyHostToDevice));
+
+    projection_2dgs_kernel<<<1, N>>>(
+        d_means, d_rotation, d_scaling, d_viewmat,
+        fx, fy, cx, cy,
+        0.2f, (int)W, (int)H,
+        d_T, d_means2d, d_radii, d_depths, d_normals, N
+    );
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    RasterSceneData scene;
+    scene.means2d.resize(N * 2);
+    scene.T.resize(N * 9);
+    scene.depths.resize(N);
+    scene.normals.resize(N * 3);
+    scene.radii.resize(N * 2);
+    CUDA_CHECK(cudaMemcpy(scene.means2d.data(), d_means2d, N * 2 * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(scene.T.data(), d_T, N * 9 * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(scene.depths.data(), d_depths, N * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(scene.normals.data(), d_normals, N * 3 * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(scene.radii.data(), d_radii, N * 2 * sizeof(int32_t), cudaMemcpyDeviceToHost));
+
+    cudaFree(d_means); cudaFree(d_rotation); cudaFree(d_scaling); cudaFree(d_viewmat);
+    cudaFree(d_T); cudaFree(d_means2d); cudaFree(d_depths); cudaFree(d_normals); cudaFree(d_radii);
+    return scene;
+}
+
 static bool run_projection_gradcheck() {
     printf("=== Projection Gradient Check ===\n");
 
@@ -223,11 +300,12 @@ static bool run_projection_gradcheck() {
         -0.05f,  0.09f, -0.04f,
          0.02f, -0.08f,  0.06f
     };
+    std::vector<float> h_v_normals = {0.09f, -0.07f, 0.05f};
 
     float *d_means, *d_rotation, *d_scaling, *d_viewmat;
     float *d_T, *d_means2d, *d_depths, *d_normals;
     int32_t* d_radii;
-    float *d_vT, *d_v_means2d, *d_v_depths;
+    float *d_vT, *d_v_means2d, *d_v_depths, *d_v_normals;
     float *d_g_means, *d_g_rotation, *d_g_scaling;
 
     CUDA_CHECK(cudaMalloc(&d_means, 3*sizeof(float)));
@@ -242,6 +320,7 @@ static bool run_projection_gradcheck() {
     CUDA_CHECK(cudaMalloc(&d_vT, 9*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_v_means2d, 2*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_v_depths, sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_v_normals, 3*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_g_means, 3*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_g_rotation, 4*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_g_scaling, 3*sizeof(float)));
@@ -250,6 +329,7 @@ static bool run_projection_gradcheck() {
     CUDA_CHECK(cudaMemcpy(d_vT, h_vT.data(), 9*sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_v_means2d, h_v_means2d.data(), 2*sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_v_depths, h_v_depths.data(), sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v_normals, h_v_normals.data(), 3*sizeof(float), cudaMemcpyHostToDevice));
 
     auto eval = [&]() -> float {
         CUDA_CHECK(cudaMemcpy(d_means, h_means.data(), 3*sizeof(float), cudaMemcpyHostToDevice));
@@ -264,11 +344,15 @@ static bool run_projection_gradcheck() {
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        std::vector<float> out_T(9), out_means2d(2), out_depths(1);
+        std::vector<float> out_T(9), out_means2d(2), out_depths(1), out_normals(3);
         CUDA_CHECK(cudaMemcpy(out_T.data(), d_T, 9*sizeof(float), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(out_means2d.data(), d_means2d, 2*sizeof(float), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(out_depths.data(), d_depths, sizeof(float), cudaMemcpyDeviceToHost));
-        return dot_host(out_T, h_vT) + dot_host(out_means2d, h_v_means2d) + dot_host(out_depths, h_v_depths);
+        CUDA_CHECK(cudaMemcpy(out_normals.data(), d_normals, 3*sizeof(float), cudaMemcpyDeviceToHost));
+        return dot_host(out_T, h_vT) +
+               dot_host(out_means2d, h_v_means2d) +
+               dot_host(out_depths, h_v_depths) +
+               dot_host(out_normals, h_v_normals);
     };
 
     (void)eval();
@@ -276,7 +360,7 @@ static bool run_projection_gradcheck() {
         d_means, d_rotation, d_scaling, d_viewmat,
         fx, fy, cx, cy,
         d_T, d_radii,
-        d_vT, d_v_means2d, d_v_depths, nullptr,
+        d_vT, d_v_means2d, d_v_depths, d_v_normals,
         d_g_means, d_g_rotation, d_g_scaling, N
     );
 
@@ -293,12 +377,13 @@ static bool run_projection_gradcheck() {
     ok &= check_close("means.z",    g_means[2],    centered_diff(h_means,    2, eps, eval),     5e-3f, 5e-2f);
     ok &= check_close("rotation.x", g_rotation[1], centered_diff(h_rotation, 1, rot_eps, eval), 5e-3f, 7e-2f);
     ok &= check_close("rotation.y", g_rotation[2], centered_diff(h_rotation, 2, rot_eps, eval), 5e-3f, 7e-2f);
+    ok &= check_close("rotation.z", g_rotation[3], centered_diff(h_rotation, 3, rot_eps, eval), 5e-3f, 7e-2f);
     ok &= check_close("scaling.x",  g_scaling[0],  centered_diff(h_scaling,  0, eps, eval),     5e-3f, 5e-2f);
     ok &= check_close("scaling.y",  g_scaling[1],  centered_diff(h_scaling,  1, eps, eval),     5e-3f, 5e-2f);
 
     cudaFree(d_means); cudaFree(d_rotation); cudaFree(d_scaling); cudaFree(d_viewmat);
     cudaFree(d_T); cudaFree(d_means2d); cudaFree(d_depths); cudaFree(d_normals);
-    cudaFree(d_radii); cudaFree(d_vT); cudaFree(d_v_means2d); cudaFree(d_v_depths);
+    cudaFree(d_radii); cudaFree(d_vT); cudaFree(d_v_means2d); cudaFree(d_v_depths); cudaFree(d_v_normals);
     cudaFree(d_g_means); cudaFree(d_g_rotation); cudaFree(d_g_scaling);
 
     printf("%s\n\n", ok ? "Projection gradients passed." : "Projection gradients FAILED.");
@@ -439,17 +524,18 @@ static bool run_rasterize_gradcheck() {
         }
     }
 
-    float *d_rast_means2d, *d_rast_T, *d_rast_opacity, *d_rast_colors, *d_rast_depths;
+    float *d_rast_means2d, *d_rast_T, *d_rast_opacity, *d_rast_colors, *d_rast_depths, *d_rast_normals;
     int32_t* d_rast_radii;
     float *d_render_colors, *d_render_alphas, *d_v_render;
     int32_t* d_last_ids;
-    float *d_g_T, *d_g_opacity, *d_g_colors, *d_g_means2d, *d_g_means2d_abs;
+    float *d_g_T, *d_g_opacity, *d_g_colors, *d_g_normals, *d_g_means2d, *d_g_means2d_abs;
 
     CUDA_CHECK(cudaMalloc(&d_rast_means2d, 2*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_rast_T, 9*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_rast_opacity, sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_rast_colors, 3*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_rast_depths, sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_rast_normals, 3*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_rast_radii, 2*sizeof(int32_t)));
     CUDA_CHECK(cudaMalloc(&d_render_colors, W*H*3*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_render_alphas, W*H*sizeof(float)));
@@ -458,9 +544,11 @@ static bool run_rasterize_gradcheck() {
     CUDA_CHECK(cudaMalloc(&d_g_T, 9*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_g_opacity, sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_g_colors, 3*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_g_normals, 3*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_g_means2d, 2*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_g_means2d_abs, 2*sizeof(float)));
     CUDA_CHECK(cudaMemcpy(d_rast_depths, h_depths.data(), sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_rast_normals, 0, 3*sizeof(float)));
     CUDA_CHECK(cudaMemcpy(d_rast_radii, h_radii.data(), 2*sizeof(int32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_v_render, h_v_render.data(), W*H*3*sizeof(float), cudaMemcpyHostToDevice));
 
@@ -477,10 +565,11 @@ static bool run_rasterize_gradcheck() {
         CUDA_CHECK(cudaMemset(d_render_colors, 0, W*H*3*sizeof(float)));
         CUDA_CHECK(cudaMemset(d_render_alphas, 0, W*H*sizeof(float)));
         launch_rasterize_fwd(
-            d_rast_means2d, d_rast_T, d_rast_opacity, d_rast_colors,
+            d_rast_means2d, d_rast_T, d_rast_opacity, d_rast_colors, d_rast_normals,
             tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
             W, H,
-            d_render_colors, d_render_alphas, d_last_ids
+            d_render_colors, d_render_alphas,
+            nullptr, nullptr, nullptr, d_last_ids
         );
 
         std::vector<float> h_render(W * H * 3);
@@ -501,22 +590,25 @@ static bool run_rasterize_gradcheck() {
     CUDA_CHECK(cudaMemset(d_render_colors, 0, W*H*3*sizeof(float)));
     CUDA_CHECK(cudaMemset(d_render_alphas, 0, W*H*sizeof(float)));
     launch_rasterize_fwd(
-        d_rast_means2d, d_rast_T, d_rast_opacity, d_rast_colors,
+        d_rast_means2d, d_rast_T, d_rast_opacity, d_rast_colors, d_rast_normals,
         tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
         W, H,
-        d_render_colors, d_render_alphas, d_last_ids
+        d_render_colors, d_render_alphas,
+        nullptr, nullptr, nullptr, d_last_ids
     );
     CUDA_CHECK(cudaMemset(d_g_T, 0, 9*sizeof(float)));
     CUDA_CHECK(cudaMemset(d_g_opacity, 0, sizeof(float)));
     CUDA_CHECK(cudaMemset(d_g_colors, 0, 3*sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_g_normals, 0, 3*sizeof(float)));
     CUDA_CHECK(cudaMemset(d_g_means2d, 0, 2*sizeof(float)));
     CUDA_CHECK(cudaMemset(d_g_means2d_abs, 0, 2*sizeof(float)));
     launch_rasterize_bwd(
-        d_rast_means2d, d_rast_T, d_rast_opacity, d_rast_colors,
+        d_rast_means2d, d_rast_T, d_rast_opacity, d_rast_colors, d_rast_normals,
         tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
-        d_render_alphas, d_last_ids, d_v_render,
+        d_render_alphas, nullptr, d_last_ids,
+        d_v_render, nullptr, nullptr, nullptr, nullptr,
         W, H,
-        d_g_T, d_g_opacity, d_g_colors, d_g_means2d, d_g_means2d_abs
+        d_g_T, d_g_opacity, d_g_colors, d_g_normals, d_g_means2d, d_g_means2d_abs
     );
 
     std::vector<float> g_T(9), g_colors(3), g_means2d(2), g_opacity(1);
@@ -536,12 +628,346 @@ static bool run_rasterize_gradcheck() {
 
     cudaFree(d_means2d); cudaFree(d_T);
     cudaFree(d_rast_means2d); cudaFree(d_rast_T); cudaFree(d_rast_opacity);
-    cudaFree(d_rast_colors); cudaFree(d_rast_depths); cudaFree(d_rast_radii);
+    cudaFree(d_rast_colors); cudaFree(d_rast_depths); cudaFree(d_rast_normals); cudaFree(d_rast_radii);
     cudaFree(d_render_colors); cudaFree(d_render_alphas); cudaFree(d_last_ids);
-    cudaFree(d_v_render); cudaFree(d_g_T); cudaFree(d_g_opacity); cudaFree(d_g_colors);
+    cudaFree(d_v_render); cudaFree(d_g_T); cudaFree(d_g_opacity); cudaFree(d_g_colors); cudaFree(d_g_normals);
     cudaFree(d_g_means2d); cudaFree(d_g_means2d_abs);
 
     printf("%s\n\n", ok ? "Rasterizer gradients passed." : "Rasterizer gradients FAILED.");
+    return ok;
+}
+
+static bool run_rasterize_aux_gradcheck() {
+    printf("=== Rasterizer Aux Gradient Check ===\n");
+
+    const int N = 2;
+    const uint32_t W = 24, H = 24;
+    const float fx = 44.f, fy = 44.f, cx = 12.f, cy = 12.f;
+
+    RasterSceneData scene = make_overlapping_raster_scene(W, H, fx, fy, cx, cy);
+    std::vector<float> h_means2d = scene.means2d;
+    std::vector<float> h_T = scene.T;
+    std::vector<float> h_depths = scene.depths;
+    std::vector<int32_t> h_radii = scene.radii;
+    std::vector<float> h_normals = {
+         0.20f,  0.10f, 0.97f,
+        -0.12f,  0.18f, 0.94f
+    };
+    std::vector<float> h_opacity = {0.35f, 0.05f};
+    std::vector<float> h_colors = {
+        0.75f, 0.20f, 0.10f,
+        0.10f, 0.55f, 0.80f
+    };
+
+    std::vector<float> h_v_render_colors(W * H * 3, 0.f);
+    std::vector<float> h_v_render_normals(W * H * 3, 0.f);
+    std::vector<float> h_v_render_depth(W * H, 0.f);
+    std::vector<float> h_v_render_distort(W * H, 0.f);
+    for (uint32_t y = 7; y <= 16; ++y) {
+        for (uint32_t x = 7; x <= 16; ++x) {
+            size_t pix = y * W + x;
+            h_v_render_normals[pix * 3 + 0] = 0.02f * ((int)x - 11);
+            h_v_render_normals[pix * 3 + 1] = -0.015f * ((int)y - 11);
+            h_v_render_normals[pix * 3 + 2] = 0.01f;
+            h_v_render_depth[pix] = 0.004f * ((int)x + (int)y - 22);
+            h_v_render_distort[pix] = 0.03f;
+        }
+    }
+
+    float *d_means2d, *d_T, *d_opacity, *d_colors, *d_depths, *d_normals;
+    int32_t* d_radii;
+    float *d_render_colors, *d_render_alphas, *d_render_normals, *d_render_depth, *d_render_distort;
+    int32_t* d_last_ids;
+    float *d_v_render_colors, *d_v_render_normals, *d_v_render_depth, *d_v_render_distort;
+    float *d_g_T, *d_g_opacity, *d_g_colors, *d_g_normals, *d_g_means2d, *d_g_means2d_abs;
+
+    CUDA_CHECK(cudaMalloc(&d_means2d, N * 2 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_T, N * 9 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_opacity, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_colors, N * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_depths, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_normals, N * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_radii, N * 2 * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_render_colors, W * H * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_render_alphas, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_render_normals, W * H * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_render_depth, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_render_distort, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_last_ids, W * H * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_v_render_colors, W * H * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_v_render_normals, W * H * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_v_render_depth, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_v_render_distort, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_g_T, N * 9 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_g_opacity, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_g_colors, N * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_g_normals, N * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_g_means2d, N * 2 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_g_means2d_abs, N * 2 * sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpy(d_depths, h_depths.data(), N * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_radii, h_radii.data(), N * 2 * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v_render_colors, h_v_render_colors.data(), W * H * 3 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v_render_normals, h_v_render_normals.data(), W * H * 3 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v_render_depth, h_v_render_depth.data(), W * H * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v_render_distort, h_v_render_distort.data(), W * H * sizeof(float), cudaMemcpyHostToDevice));
+
+    auto eval = [&]() -> float {
+        CUDA_CHECK(cudaMemcpy(d_means2d, h_means2d.data(), N * 2 * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_T, h_T.data(), N * 9 * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_opacity, h_opacity.data(), N * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_colors, h_colors.data(), N * 3 * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_normals, h_normals.data(), N * 3 * sizeof(float), cudaMemcpyHostToDevice));
+
+        TileIntersectBuffers tile_buf = launch_tile_intersect(
+            d_means2d, d_radii, d_depths, N, W, H, TILE_SIZE
+        );
+        CUDA_CHECK(cudaMemset(d_render_colors, 0, W * H * 3 * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_render_alphas, 0, W * H * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_render_normals, 0, W * H * 3 * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_render_depth, 0, W * H * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_render_distort, 0, W * H * sizeof(float)));
+        launch_rasterize_fwd(
+            d_means2d, d_T, d_opacity, d_colors, d_normals,
+            tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
+            W, H,
+            d_render_colors, d_render_alphas, d_render_normals,
+            d_render_depth, d_render_distort, d_last_ids
+        );
+
+        std::vector<float> out_normals(W * H * 3), out_depth(W * H), out_distort(W * H);
+        CUDA_CHECK(cudaMemcpy(out_normals.data(), d_render_normals, W * H * 3 * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(out_depth.data(), d_render_depth, W * H * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(out_distort.data(), d_render_distort, W * H * sizeof(float), cudaMemcpyDeviceToHost));
+        free_tile_intersect_buffers(tile_buf);
+        return dot_host(out_normals, h_v_render_normals) +
+               dot_host(out_depth, h_v_render_depth) +
+               dot_host(out_distort, h_v_render_distort);
+    };
+
+    (void)eval();
+
+    CUDA_CHECK(cudaMemcpy(d_means2d, h_means2d.data(), N * 2 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_T, h_T.data(), N * 9 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_opacity, h_opacity.data(), N * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_colors, h_colors.data(), N * 3 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_normals, h_normals.data(), N * 3 * sizeof(float), cudaMemcpyHostToDevice));
+    TileIntersectBuffers tile_buf = launch_tile_intersect(
+        d_means2d, d_radii, d_depths, N, W, H, TILE_SIZE
+    );
+    CUDA_CHECK(cudaMemset(d_render_colors, 0, W * H * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_render_alphas, 0, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_render_normals, 0, W * H * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_render_depth, 0, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_render_distort, 0, W * H * sizeof(float)));
+    launch_rasterize_fwd(
+        d_means2d, d_T, d_opacity, d_colors, d_normals,
+        tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
+        W, H,
+        d_render_colors, d_render_alphas, d_render_normals,
+        d_render_depth, d_render_distort, d_last_ids
+    );
+    CUDA_CHECK(cudaMemset(d_g_T, 0, N * 9 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_g_opacity, 0, N * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_g_colors, 0, N * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_g_normals, 0, N * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_g_means2d, 0, N * 2 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_g_means2d_abs, 0, N * 2 * sizeof(float)));
+    launch_rasterize_bwd(
+        d_means2d, d_T, d_opacity, d_colors, d_normals,
+        tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
+        d_render_alphas, d_render_depth, d_last_ids,
+        d_v_render_colors, nullptr, d_v_render_normals, d_v_render_depth, d_v_render_distort,
+        W, H,
+        d_g_T, d_g_opacity, d_g_colors, d_g_normals, d_g_means2d, d_g_means2d_abs
+    );
+
+    std::vector<float> g_T(N * 9), g_opacity(N), g_normals(N * 3);
+    CUDA_CHECK(cudaMemcpy(g_T.data(), d_g_T, N * 9 * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(g_opacity.data(), d_g_opacity, N * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(g_normals.data(), d_g_normals, N * 3 * sizeof(float), cudaMemcpyDeviceToHost));
+    free_tile_intersect_buffers(tile_buf);
+
+    bool ok = true;
+    const float eps = 1e-3f;
+    ok &= check_close("normal0.x", g_normals[0], centered_diff(h_normals, 0, eps, eval), 8e-3f, 9e-2f);
+    ok &= check_close("rayT0[8]",  g_T[8],      centered_diff(h_T,       8, eps, eval), 8e-3f, 9e-2f);
+    ok &= check_close("opacity0",  g_opacity[0], centered_diff(h_opacity, 0, eps, eval), 8e-3f, 9e-2f);
+
+    cudaFree(d_means2d); cudaFree(d_T); cudaFree(d_opacity); cudaFree(d_colors); cudaFree(d_depths); cudaFree(d_normals);
+    cudaFree(d_radii); cudaFree(d_render_colors); cudaFree(d_render_alphas); cudaFree(d_render_normals);
+    cudaFree(d_render_depth); cudaFree(d_render_distort); cudaFree(d_last_ids);
+    cudaFree(d_v_render_colors); cudaFree(d_v_render_normals); cudaFree(d_v_render_depth); cudaFree(d_v_render_distort);
+    cudaFree(d_g_T); cudaFree(d_g_opacity); cudaFree(d_g_colors); cudaFree(d_g_normals); cudaFree(d_g_means2d); cudaFree(d_g_means2d_abs);
+
+    printf("%s\n\n", ok ? "Rasterizer aux gradients passed." : "Rasterizer aux gradients FAILED.");
+    return ok;
+}
+
+static bool run_geometry_loss_gradcheck() {
+    printf("=== Geometry Loss Gradient Check ===\n");
+
+    const int N = 2;
+    const uint32_t W = 24, H = 24;
+    const float fx = 44.f, fy = 44.f, cx = 12.f, cy = 12.f;
+    const float normal_lambda = 5e-2f;
+    const float dist_lambda = 1e-2f;
+
+    RasterSceneData scene = make_overlapping_raster_scene(W, H, fx, fy, cx, cy);
+    std::vector<float> h_means2d = scene.means2d;
+    std::vector<float> h_T = scene.T;
+    std::vector<float> h_depths = scene.depths;
+    std::vector<int32_t> h_radii = scene.radii;
+    std::vector<float> h_normals = {
+         0.24f,  0.08f, 0.95f,
+        -0.15f,  0.20f, 0.91f
+    };
+    std::vector<float> h_opacity = {0.35f, 0.05f};
+    std::vector<float> h_colors = {
+        0.75f, 0.20f, 0.10f,
+        0.10f, 0.55f, 0.80f
+    };
+
+    float *d_means2d, *d_T, *d_opacity, *d_colors, *d_depths, *d_normals;
+    int32_t* d_radii;
+    float *d_render_colors, *d_render_alphas, *d_render_normals, *d_render_depth, *d_render_distort;
+    float *d_grad_render_colors, *d_grad_render_alphas, *d_grad_render_normals, *d_grad_render_depth, *d_grad_render_distort;
+    int32_t* d_last_ids;
+    float *d_g_T, *d_g_opacity, *d_g_colors, *d_g_normals, *d_g_means2d, *d_g_means2d_abs;
+    GeometryLossWorkspace geom_ws{};
+
+    CUDA_CHECK(cudaMalloc(&d_means2d, N * 2 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_T, N * 9 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_opacity, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_colors, N * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_depths, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_normals, N * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_radii, N * 2 * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_render_colors, W * H * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_render_alphas, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_render_normals, W * H * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_render_depth, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_render_distort, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_grad_render_colors, W * H * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_grad_render_alphas, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_grad_render_normals, W * H * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_grad_render_depth, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_grad_render_distort, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_last_ids, W * H * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_g_T, N * 9 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_g_opacity, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_g_colors, N * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_g_normals, N * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_g_means2d, N * 2 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_g_means2d_abs, N * 2 * sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpy(d_depths, h_depths.data(), N * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_radii, h_radii.data(), N * 2 * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_grad_render_colors, 0, W * H * 3 * sizeof(float)));
+    ensure_geometry_loss_workspace(geom_ws, W * H);
+
+    auto eval = [&]() -> float {
+        CUDA_CHECK(cudaMemcpy(d_means2d, h_means2d.data(), N * 2 * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_T, h_T.data(), N * 9 * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_opacity, h_opacity.data(), N * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_colors, h_colors.data(), N * 3 * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_normals, h_normals.data(), N * 3 * sizeof(float), cudaMemcpyHostToDevice));
+
+        TileIntersectBuffers tile_buf = launch_tile_intersect(
+            d_means2d, d_radii, d_depths, N, W, H, TILE_SIZE
+        );
+        CUDA_CHECK(cudaMemset(d_render_colors, 0, W * H * 3 * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_render_alphas, 0, W * H * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_render_normals, 0, W * H * 3 * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_render_depth, 0, W * H * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_render_distort, 0, W * H * sizeof(float)));
+        launch_rasterize_fwd(
+            d_means2d, d_T, d_opacity, d_colors, d_normals,
+            tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
+            W, H,
+            d_render_colors, d_render_alphas, d_render_normals,
+            d_render_depth, d_render_distort, d_last_ids
+        );
+        CUDA_CHECK(cudaMemset(d_grad_render_alphas, 0, W * H * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_grad_render_normals, 0, W * H * 3 * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_grad_render_depth, 0, W * H * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_grad_render_distort, 0, W * H * sizeof(float)));
+        GeometryLossResult geom = geometry_loss_2dgs(
+            d_render_depth, d_render_alphas, d_render_normals, d_render_distort,
+            d_grad_render_depth, d_grad_render_alphas, d_grad_render_normals, d_grad_render_distort,
+            geom_ws, H, W, fx, fy, cx, cy, normal_lambda, dist_lambda
+        );
+        free_tile_intersect_buffers(tile_buf);
+        return geom.loss_total;
+    };
+
+    (void)eval();
+
+    CUDA_CHECK(cudaMemcpy(d_means2d, h_means2d.data(), N * 2 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_T, h_T.data(), N * 9 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_opacity, h_opacity.data(), N * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_colors, h_colors.data(), N * 3 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_normals, h_normals.data(), N * 3 * sizeof(float), cudaMemcpyHostToDevice));
+    TileIntersectBuffers tile_buf = launch_tile_intersect(
+        d_means2d, d_radii, d_depths, N, W, H, TILE_SIZE
+    );
+    CUDA_CHECK(cudaMemset(d_render_colors, 0, W * H * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_render_alphas, 0, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_render_normals, 0, W * H * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_render_depth, 0, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_render_distort, 0, W * H * sizeof(float)));
+    launch_rasterize_fwd(
+        d_means2d, d_T, d_opacity, d_colors, d_normals,
+        tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
+        W, H,
+        d_render_colors, d_render_alphas, d_render_normals,
+        d_render_depth, d_render_distort, d_last_ids
+    );
+    CUDA_CHECK(cudaMemset(d_grad_render_alphas, 0, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_grad_render_normals, 0, W * H * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_grad_render_depth, 0, W * H * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_grad_render_distort, 0, W * H * sizeof(float)));
+    (void)geometry_loss_2dgs(
+        d_render_depth, d_render_alphas, d_render_normals, d_render_distort,
+        d_grad_render_depth, d_grad_render_alphas, d_grad_render_normals, d_grad_render_distort,
+        geom_ws, H, W, fx, fy, cx, cy, normal_lambda, dist_lambda
+    );
+    CUDA_CHECK(cudaMemset(d_g_T, 0, N * 9 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_g_opacity, 0, N * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_g_colors, 0, N * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_g_normals, 0, N * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_g_means2d, 0, N * 2 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_g_means2d_abs, 0, N * 2 * sizeof(float)));
+    launch_rasterize_bwd(
+        d_means2d, d_T, d_opacity, d_colors, d_normals,
+        tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
+        d_render_alphas, d_render_depth, d_last_ids,
+        d_grad_render_colors, d_grad_render_alphas, d_grad_render_normals,
+        d_grad_render_depth, d_grad_render_distort,
+        W, H,
+        d_g_T, d_g_opacity, d_g_colors, d_g_normals, d_g_means2d, d_g_means2d_abs
+    );
+
+    std::vector<float> g_T(N * 9), g_opacity(N), g_normals(N * 3);
+    CUDA_CHECK(cudaMemcpy(g_T.data(), d_g_T, N * 9 * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(g_opacity.data(), d_g_opacity, N * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(g_normals.data(), d_g_normals, N * 3 * sizeof(float), cudaMemcpyDeviceToHost));
+    free_tile_intersect_buffers(tile_buf);
+
+    bool ok = true;
+    const float eps = 1e-3f;
+    ok &= check_close("geom normal0.x", g_normals[0], centered_diff(h_normals, 0, eps, eval), 1e-2f, 1.2e-1f);
+    ok &= check_close("geom rayT0[8]",  g_T[8],      centered_diff(h_T,       8, eps, eval), 1e-2f, 1.2e-1f);
+    ok &= check_close("geom opacity0",  g_opacity[0], centered_diff(h_opacity, 0, eps, eval), 1e-2f, 1.2e-1f);
+
+    free_geometry_loss_workspace(geom_ws);
+    cudaFree(d_means2d); cudaFree(d_T); cudaFree(d_opacity); cudaFree(d_colors); cudaFree(d_depths); cudaFree(d_normals);
+    cudaFree(d_radii); cudaFree(d_render_colors); cudaFree(d_render_alphas); cudaFree(d_render_normals);
+    cudaFree(d_render_depth); cudaFree(d_render_distort); cudaFree(d_grad_render_colors); cudaFree(d_grad_render_alphas);
+    cudaFree(d_grad_render_normals); cudaFree(d_grad_render_depth); cudaFree(d_grad_render_distort); cudaFree(d_last_ids);
+    cudaFree(d_g_T); cudaFree(d_g_opacity); cudaFree(d_g_colors); cudaFree(d_g_normals); cudaFree(d_g_means2d); cudaFree(d_g_means2d_abs);
+
+    printf("%s\n\n", ok ? "Geometry loss gradients passed." : "Geometry loss gradients FAILED.");
     return ok;
 }
 
@@ -552,6 +978,8 @@ int main() {
     ok &= run_projection_gradcheck();
     ok &= run_sh_gradcheck();
     ok &= run_rasterize_gradcheck();
+    ok &= run_rasterize_aux_gradcheck();
+    ok &= run_geometry_loss_gradcheck();
 
     printf("%s\n", ok ? "All gradient checks passed." : "SOME GRADIENT CHECKS FAILED.");
     return ok ? 0 : 1;

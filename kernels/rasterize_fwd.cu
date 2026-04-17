@@ -32,10 +32,13 @@
 //   T    *= (1 - alpha)                update transmittance
 //
 // Outputs:
-//   render_colors [H, W, 3]  — accumulated RGB
-//   render_alphas [H, W]     — 1 - T_final (total opacity)
-//   last_ids      [H, W]     — index in sorted list of last contributing Gaussian
-//                               (needed by backward pass to replay in reverse)
+//   render_colors      [H, W, 3]  — accumulated RGB
+//   render_alphas      [H, W]     — 1 - T_final (total opacity)
+//   render_normals     [H, W, 3]  — accumulated camera-space normals (optional)
+//   render_depth_accum [H, W]     — accumulated expected-depth numerator Σ vis·depth (optional)
+//   render_distort     [H, W]     — per-pixel depth distortion regularizer (optional)
+//   last_ids           [H, W]     — index in sorted list of last contributing Gaussian
+//                                    (needed by backward pass to replay in reverse)
 
 #include "splat_data.cuh"
 
@@ -54,6 +57,7 @@ static constexpr uint32_t TILE_SIZE       = 16;
 static constexpr float    ALPHA_THRESHOLD = 1.f / 255.f;
 // 2D screen-space falloff weight — 1/(2*0.3²) = 1/0.18 ≈ 5.56, gsplat uses 2.0
 static constexpr float    FILTER_INV_SQ   = 2.0f;
+static constexpr float    RASTER_NEAR_PLANE = 0.2f;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Device helpers
@@ -78,6 +82,7 @@ __global__ void rasterize_fwd_kernel(
     const float*   __restrict__ opacities,     // [N]      raw logit, sigmoid applied here
     // appearance
     const float*   __restrict__ colors,        // [N, 3]   pre-evaluated RGB in [0,1]
+    const float*   __restrict__ normals,       // [N, 3]   camera-space normals
     // tile data (from intersect_tile)
     const int32_t* __restrict__ tile_offsets,  // [tile_h * tile_w]
     const int32_t* __restrict__ flatten_ids,   // [n_isects]  sorted Gaussian indices
@@ -90,6 +95,9 @@ __global__ void rasterize_fwd_kernel(
     // outputs
     float*   __restrict__ render_colors,  // [H, W, 3]
     float*   __restrict__ render_alphas,  // [H, W]
+    float*   __restrict__ render_normals, // [H, W, 3] or nullptr
+    float*   __restrict__ render_depth_accum, // [H, W] or nullptr
+    float*   __restrict__ render_distort, // [H, W] or nullptr
     int32_t* __restrict__ last_ids        // [H, W]
 ) {
     auto block = cg::this_thread_block();
@@ -129,6 +137,10 @@ __global__ void rasterize_fwd_kernel(
     // ── Per-pixel state ───────────────────────────────────────────────────────
     float T        = 1.0f;
     float pix_r    = 0.f, pix_g = 0.f, pix_b = 0.f;
+    float pix_nx   = 0.f, pix_ny = 0.f, pix_nz = 0.f;
+    float pix_depth = 0.f;
+    float distort   = 0.f;
+    float accum_vis_depth = 0.f;
     int32_t cur_idx = -1;
     uint32_t tr    = block.thread_rank();
 
@@ -176,6 +188,8 @@ __global__ void rasterize_fwd_kernel(
 
             float u = zeta.x / zeta.z;
             float v = zeta.y / zeta.z;
+            float depth = u * w_M.x + v * w_M.y + w_M.z;
+            if (depth < RASTER_NEAR_PLANE) continue;
 
             // Merge 3D Gaussian kernel with 2D screen falloff (anti-aliasing)
             float gauss_3d = u*u + v*v;
@@ -196,6 +210,17 @@ __global__ void rasterize_fwd_kernel(
             pix_r += colors[g*3+0] * vis;
             pix_g += colors[g*3+1] * vis;
             pix_b += colors[g*3+2] * vis;
+            if (render_normals != nullptr) {
+                pix_nx += normals[g*3+0] * vis;
+                pix_ny += normals[g*3+1] * vis;
+                pix_nz += normals[g*3+2] * vis;
+            }
+            if (render_depth_accum != nullptr)
+                pix_depth += depth * vis;
+            if (render_distort != nullptr) {
+                distort += 2.f * (vis * depth * (1.f - T) - vis * accum_vis_depth);
+                accum_vis_depth += vis * depth;
+            }
 
             cur_idx = batch_start + t;
             T = next_T;
@@ -209,6 +234,15 @@ __global__ void rasterize_fwd_kernel(
         render_colors[pix_id*3+1] = pix_g;
         render_colors[pix_id*3+2] = pix_b;
         render_alphas[pix_id]     = 1.f - T;
+        if (render_normals != nullptr) {
+            render_normals[pix_id*3+0] = pix_nx;
+            render_normals[pix_id*3+1] = pix_ny;
+            render_normals[pix_id*3+2] = pix_nz;
+        }
+        if (render_depth_accum != nullptr)
+            render_depth_accum[pix_id] = pix_depth;
+        if (render_distort != nullptr)
+            render_distort[pix_id] = distort;
         last_ids[pix_id]          = cur_idx;
     }
 }
@@ -222,6 +256,7 @@ void launch_rasterize_fwd(
     const float*   d_ray_transforms,
     const float*   d_opacities,
     const float*   d_colors,
+    const float*   d_normals,
     const int32_t* d_tile_offsets,
     const int32_t* d_flatten_ids,
     int32_t        n_isects,
@@ -230,6 +265,9 @@ void launch_rasterize_fwd(
     // outputs
     float*   d_render_colors,
     float*   d_render_alphas,
+    float*   d_render_normals,
+    float*   d_render_depth_accum,
+    float*   d_render_distort,
     int32_t* d_last_ids
 ) {
     uint32_t tile_width  = (image_width  + TILE_SIZE - 1) / TILE_SIZE;
@@ -248,10 +286,11 @@ void launch_rasterize_fwd(
     );
 
     rasterize_fwd_kernel<<<grid, block, smem>>>(
-        d_means2d, d_ray_transforms, d_opacities, d_colors,
+        d_means2d, d_ray_transforms, d_opacities, d_colors, d_normals,
         d_tile_offsets, d_flatten_ids, n_isects,
         image_width, image_height, tile_width, tile_height,
-        d_render_colors, d_render_alphas, d_last_ids
+        d_render_colors, d_render_alphas, d_render_normals,
+        d_render_depth_accum, d_render_distort, d_last_ids
     );
     CUDA_CHECK(cudaGetLastError());
 }
@@ -409,9 +448,10 @@ int main() {
     CUDA_CHECK(cudaMemset(d_render_alphas, 0, H*W*sizeof(float)));
 
     launch_rasterize_fwd(
-        d_means2d, d_ray_transforms, d_opacities, d_colors,
+        d_means2d, d_ray_transforms, d_opacities, d_colors, d_normals,
         d_tile_offsets, d_flatten_ids_sorted, n_isects,
-        W, H, d_render_colors, d_render_alphas, d_last_ids
+        W, H, d_render_colors, d_render_alphas,
+        nullptr, nullptr, nullptr, d_last_ids
     );
 
     // ── Sample pixels at expected Gaussian centers ────────────────────────────

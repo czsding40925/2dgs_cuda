@@ -1,4 +1,4 @@
-# 2DGS Project
+# 2DGS CUDA
 
 Learning-focused reimplementation of 2D Gaussian Splatting, built up from the CUDA kernels.
 Pure C++/CUDA first — Python bindings added later once the kernels are solid.
@@ -6,7 +6,7 @@ Pure C++/CUDA first — Python bindings added later once the kernels are solid.
 ## Structure
 
 ```
-project/
+repo root/
 ├── train.cu                    # *** entry point — load scene, init SplatData, training loop
 ├── kernels/
 │   ├── splat_data.cuh          # *** central data structure — owns all Gaussian GPU arrays
@@ -85,7 +85,8 @@ Parameters are stored **raw** (pre-activation) and converted at read time inside
 Each iteration:
 1. **Pick a camera** — random view from the loaded scene
 2. **Forward pass** — project Gaussians, tile-intersect, rasterize → rendered image
-3. **Loss** — load the matching RGB image, then compute L1 + D-SSIM
+3. **Loss** — load the matching RGB image, compute L1 + D-SSIM, then add the
+   2DGS distortion and normal-consistency regularizers on their scheduled iterations
 4. **Backward pass** — rasterizer → projection → SH coefficient backward
 5. **Optimizer step** — Adam with per-group learning rates
 6. **Densification** — prune, clone, and split by accumulated screen-space gradient
@@ -105,7 +106,11 @@ tile intersection        → isect_ids [n_isects], flatten_ids [n_isects], tile_
   ↓  (radix sort on isect_ids)
 forward rasterizer       → render_colors [H,W,C], render_alphas [H,W]
   ↓
-photometric loss         → L1 + D-SSIM against target image, grad_render [H,W,C]
+render auxiliaries       → render_normals [H,W,3], render_depth_accum [H,W], render_distort [H,W]
+  ↓
+photometric + geometry loss
+                         → L1 + D-SSIM + 2DGS regularizers against target image,
+                           grad_render_color / grad_render_alpha / grad_render_normals / grad_render_depth / grad_render_distort
   ↓  backward rasterizer
 backward rasterizer      → grad_ray_transforms, grad_opacities, grad_colors, grad_means2d
   ↓  backward projection
@@ -232,9 +237,9 @@ spacing:
   robust scene extent before taking `log()`, which is useful for avoiding huge
   isolated-point splats.
 
-For this project, `project/kernels/simple_knn.cuh` now provides the
+In this repo, `kernels/simple_knn.cuh` now provides the
 `distCUDA2`-style path without Torch. It returns raw CUDA/host arrays and has a
-deterministic smoke test in `project/kernels/simple_knn_test.cu`
+deterministic smoke test in `kernels/simple_knn_test.cu`
 (`make run-knn`).
 
 #### Stage 3 — Forward rasterizer (`RasterizeToPixels2DGSFwd.cu`)
@@ -309,7 +314,7 @@ pixels within a tile share the same Gaussian.
 
 Reference: `gsplat/RasterizeToPixels2DGSBwd.cu`
 
-The project implementation lives in [`kernels/rasterize_bwd.cu`](/home/ubuntu/repos/project/kernels/rasterize_bwd.cu).
+The implementation lives in [`kernels/rasterize_bwd.cu`](kernels/rasterize_bwd.cu).
 One correctness fix is already applied on the forward side: pixels with no contributor
 now store `last_ids = -1`, so the backward replay does not accidentally process the
 first entry in a tile for empty pixels.
@@ -419,16 +424,20 @@ training set when it is small enough.
 
 ```bash
 ./build/train \
-  --data /home/ubuntu/repos/project/data/360_v2/garden \
+  --data data/360_v2/garden \
   --images images_4 \
   --iters 1000 \
   --log-every 1 \
-  --save-ply /home/ubuntu/repos/project/checkpoints/garden_latest.ply \
+  --save-ply checkpoints/garden_latest.ply \
   --save-ply-every 50 \
   --densify-start 250 \
   --densify-every 50 \
   --densify-stop 15000 \
   --opacity-reset-every 3000 \
+  --dist-lambda 1e-2 \
+  --dist-start-iter 3000 \
+  --normal-lambda 5e-2 \
+  --normal-start-iter 7000 \
   --densify-prune-alpha 0.05 \
   --densify-grow-scale3d 0.01 \
   --densify-prune-scale3d 0.1
@@ -437,11 +446,13 @@ training set when it is small enough.
 What you get:
 - a terminal progress bar with loss, SH level, `n_isects`, throughput, and ETA
 - a standard Gaussian-splatting checkpoint PLY at
-  `/home/ubuntu/repos/project/checkpoints/garden_latest.ply`, overwritten every 50 iterations
+  `checkpoints/garden_latest.ply`, overwritten every 50 iterations
 - prune/clone/split densification runs automatically between iterations 250 and 15000,
   every 50 iterations by default
 - automatic intrinsics matching for `images`, `images_2`, `images_4`, and `images_8`
 - automatic byte-cache for smaller training sets such as `garden/images_4`
+- 2DGS geometry regularization with distortion loss starting at iteration `3000`
+  and depth-derived normal consistency starting at iteration `7000`
 
 Performance note:
 - reference 2DGS / gsplat setups usually train MipNeRF-360 on downsampled image
@@ -456,7 +467,7 @@ Reference mapping used in this trainer:
 - learning rates match 2D Gaussian Splatting: `xyz=1.6e-4`, `rotation=1e-3`,
   `scaling=5e-3`, `opacity=5e-2`, `sh0=2.5e-3`
 - loss mix matches both 2DGS and gsplat: `lambda_dssim = 0.2`
-- this project now uses a more aggressive default than the references: start `250`,
+- this repo now uses a more aggressive default than the references: start `250`,
   stop `15000`, every `50`, to grow splat count sooner on current runs
 - opacity prune/reset matches the common 2DGS / gsplat 2D trainer setting: `prune_alpha=0.05`,
   opacity reset every `3000`
@@ -474,20 +485,20 @@ Useful shorter smoke test:
 
 ```bash
 ./build/train \
-  --data /home/ubuntu/repos/project/data/360_v2/garden \
+  --data data/360_v2/garden \
   --images images_4 \
   --iters 5 \
   --log-every 1 \
   --preview-every 1 \
-  --preview-out /home/ubuntu/repos/project/previews/garden_smoke/iter \
-  --save-ply /home/ubuntu/repos/project/checkpoints/garden_smoke_latest.ply
+  --preview-out previews/garden_smoke/iter \
+  --save-ply checkpoints/garden_smoke_latest.ply
 ```
 
 If you want to force densification early for debugging, the trainer also supports:
 
 ```bash
 ./build/train \
-  --data /home/ubuntu/repos/project/data/360_v2/garden \
+  --data data/360_v2/garden \
   --images images_4 \
   --iters 3 \
   --log-every 1 \
@@ -506,16 +517,20 @@ If you want to force that configuration explicitly from the terminal, these are 
 
 ```bash
 ./build/train \
-  --data /home/ubuntu/repos/project/data/360_v2/garden \
+  --data data/360_v2/garden \
   --images images_4 \
   --iters 1000 \
   --log-every 1 \
-  --save-ply /home/ubuntu/repos/project/checkpoints/garden_latest.ply \
+  --save-ply checkpoints/garden_latest.ply \
   --save-ply-every 50 \
   --densify-start 250 \
   --densify-every 50 \
   --densify-stop 15000 \
   --opacity-reset-every 3000 \
+  --dist-lambda 1e-2 \
+  --dist-start-iter 3000 \
+  --normal-lambda 5e-2 \
+  --normal-start-iter 7000 \
   --densify-prune-alpha 0.05 \
   --densify-grow-scale3d 0.01 \
   --densify-prune-scale3d 0.1
@@ -531,10 +546,10 @@ two browser viewers for it:
 The rendered viewer is the recommended one:
 
 ```bash
-pip install -r /home/ubuntu/repos/project/python/viewer_requirements.txt
+pip install -r python/viewer_requirements.txt
 
-python3 /home/ubuntu/repos/project/python/viser_splat_viewer.py \
-  --ply /home/ubuntu/repos/project/checkpoints/garden_latest.ply \
+python3 python/viser_splat_viewer.py \
+  --ply checkpoints/garden_latest.ply \
   --port 8080 \
   --resolution 1024
 ```
@@ -555,8 +570,8 @@ Useful notes:
 The older point-cloud-only viewer is still available:
 
 ```bash
-python3 /home/ubuntu/repos/project/python/viser_point_cloud_viewer.py \
-  --ply /home/ubuntu/repos/project/checkpoints/garden_latest.ply \
+python3 python/viser_point_cloud_viewer.py \
+  --ply checkpoints/garden_latest.ply \
   --port 8080 \
   --poll-seconds 2.0
 ```
@@ -578,8 +593,8 @@ checkpoint rather than a `.ply`. The adapter script
 `gsplat/examples/simple_viewer.py` unchanged:
 
 ```bash
-python3 /home/ubuntu/repos/project/python/gsplat_viewer_from_ply.py \
-  --ply /home/ubuntu/repos/project/checkpoints/garden_latest.ply \
+python3 python/gsplat_viewer_from_ply.py \
+  --ply checkpoints/garden_latest.ply \
   --gsplat-root /home/ubuntu/repos/gsplat \
   --port 8081
 ```

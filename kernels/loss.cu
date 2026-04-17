@@ -221,6 +221,8 @@ struct LossResult {
     float loss;
     float loss_l1;
     float loss_dssim;   // = 1 − mean(SSIM)
+    float loss_distort = 0.f;
+    float loss_normal = 0.f;
 };
 
 struct LossWorkspace {
@@ -365,6 +367,313 @@ LossResult photometric_loss(
     ensure_loss_workspace(ws, H * W * C);
     LossResult out = photometric_loss(render, gt, grad_out, ws, H, W, lambda, C);
     free_loss_workspace(ws);
+    return out;
+}
+
+struct GeometryLossWorkspace {
+    float* d_expected_depth = nullptr;
+    float* d_surf_normals = nullptr;
+    float* d_grad_expected_depth = nullptr;
+    float* d_grad_surf_normals = nullptr;
+    float* d_normal_error = nullptr;
+    float* d_scalar = nullptr;
+    int pix_cap = 0;
+};
+
+struct GeometryLossResult {
+    float loss_total = 0.f;
+    float loss_distort = 0.f;
+    float loss_normal = 0.f;
+};
+
+static void free_geometry_loss_workspace(GeometryLossWorkspace& ws) {
+    cudaFree(ws.d_expected_depth);      ws.d_expected_depth = nullptr;
+    cudaFree(ws.d_surf_normals);        ws.d_surf_normals = nullptr;
+    cudaFree(ws.d_grad_expected_depth); ws.d_grad_expected_depth = nullptr;
+    cudaFree(ws.d_grad_surf_normals);   ws.d_grad_surf_normals = nullptr;
+    cudaFree(ws.d_normal_error);        ws.d_normal_error = nullptr;
+    cudaFree(ws.d_scalar);              ws.d_scalar = nullptr;
+    ws.pix_cap = 0;
+}
+
+static void alloc_geometry_loss_workspace(GeometryLossWorkspace& ws, int pixels) {
+    CUDA_CHECK(cudaMalloc(&ws.d_expected_depth,      pixels * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ws.d_surf_normals,        pixels * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ws.d_grad_expected_depth, pixels * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ws.d_grad_surf_normals,   pixels * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ws.d_normal_error,        pixels * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ws.d_scalar,              sizeof(float)));
+    ws.pix_cap = pixels;
+}
+
+static void ensure_geometry_loss_workspace(GeometryLossWorkspace& ws, int pixels) {
+    if (ws.pix_cap >= pixels) return;
+    free_geometry_loss_workspace(ws);
+    alloc_geometry_loss_workspace(ws, pixels);
+}
+
+__device__ __forceinline__ float3 make_cam_point(
+    int x, int y, float depth,
+    float fx, float fy, float cx, float cy)
+{
+    float px = (float)x + 0.5f;
+    float py = (float)y + 0.5f;
+    float nx = (px - cx) / fx;
+    float ny = (py - cy) / fy;
+    return make_float3(nx * depth, ny * depth, depth);
+}
+
+__device__ __forceinline__ float3 cross_loss_f3(float3 a, float3 b) {
+    return make_float3(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    );
+}
+
+__device__ __forceinline__ float dot_loss_f3(float3 a, float3 b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+__global__ void expected_depth_fwd_kernel(
+    const float* __restrict__ depth_accum,
+    const float* __restrict__ render_alpha,
+    float* __restrict__ expected_depth,
+    int pixels)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pixels) return;
+    float alpha = render_alpha[i];
+    expected_depth[i] = (alpha > 1e-6f) ? (depth_accum[i] / alpha) : 0.f;
+}
+
+__global__ void expected_depth_bwd_kernel(
+    const float* __restrict__ depth_accum,
+    const float* __restrict__ render_alpha,
+    const float* __restrict__ v_expected_depth,
+    float* __restrict__ v_depth_accum,
+    float* __restrict__ v_render_alpha,
+    int pixels)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pixels) return;
+    float alpha = render_alpha[i];
+    if (alpha > 1e-6f) {
+        float inv_alpha = 1.f / alpha;
+        float g = v_expected_depth[i];
+        v_depth_accum[i] = g * inv_alpha;
+        v_render_alpha[i] = -g * depth_accum[i] * inv_alpha * inv_alpha;
+    } else {
+        v_depth_accum[i] = 0.f;
+        v_render_alpha[i] = 0.f;
+    }
+}
+
+__global__ void depth_to_normal_fwd_kernel(
+    const float* __restrict__ expected_depth,
+    float* __restrict__ surf_normals,
+    int H, int W,
+    float fx, float fy, float cx, float cy)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H) return;
+
+    int idx = y * W + x;
+    if (x == 0 || y == 0 || x + 1 >= W || y + 1 >= H) {
+        surf_normals[idx * 3 + 0] = 0.f;
+        surf_normals[idx * 3 + 1] = 0.f;
+        surf_normals[idx * 3 + 2] = 0.f;
+        return;
+    }
+
+    float3 p_up    = make_cam_point(x, y - 1, expected_depth[(y - 1) * W + x], fx, fy, cx, cy);
+    float3 p_down  = make_cam_point(x, y + 1, expected_depth[(y + 1) * W + x], fx, fy, cx, cy);
+    float3 p_left  = make_cam_point(x - 1, y, expected_depth[y * W + (x - 1)], fx, fy, cx, cy);
+    float3 p_right = make_cam_point(x + 1, y, expected_depth[y * W + (x + 1)], fx, fy, cx, cy);
+
+    float3 dx = make_float3(p_down.x - p_up.x, p_down.y - p_up.y, p_down.z - p_up.z);
+    float3 dy = make_float3(p_right.x - p_left.x, p_right.y - p_left.y, p_right.z - p_left.z);
+    float3 raw = cross_loss_f3(dx, dy);
+    float raw_norm_sq = dot_loss_f3(raw, raw);
+    if (raw_norm_sq <= 1e-20f) {
+        surf_normals[idx * 3 + 0] = 0.f;
+        surf_normals[idx * 3 + 1] = 0.f;
+        surf_normals[idx * 3 + 2] = 0.f;
+        return;
+    }
+
+    float inv_norm = rsqrtf(raw_norm_sq);
+    surf_normals[idx * 3 + 0] = raw.x * inv_norm;
+    surf_normals[idx * 3 + 1] = raw.y * inv_norm;
+    surf_normals[idx * 3 + 2] = raw.z * inv_norm;
+}
+
+__device__ __forceinline__ void accum_depth_vjp(
+    int x, int y,
+    float3 v_point,
+    float fx, float fy, float cx, float cy,
+    float* grad_depth,
+    int W)
+{
+    float px = (float)x + 0.5f;
+    float py = (float)y + 0.5f;
+    float nx = (px - cx) / fx;
+    float ny = (py - cy) / fy;
+    atomicAdd(&grad_depth[y * W + x], v_point.x * nx + v_point.y * ny + v_point.z);
+}
+
+__global__ void depth_to_normal_bwd_kernel(
+    const float* __restrict__ expected_depth,
+    const float* __restrict__ v_surf_normals,
+    float* __restrict__ v_expected_depth,
+    int H, int W,
+    float fx, float fy, float cx, float cy)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x == 0 || y == 0 || x + 1 >= W || y + 1 >= H) return;
+    if (x >= W || y >= H) return;
+
+    int idx = y * W + x;
+    float3 g = make_float3(
+        v_surf_normals[idx * 3 + 0],
+        v_surf_normals[idx * 3 + 1],
+        v_surf_normals[idx * 3 + 2]
+    );
+    if (g.x == 0.f && g.y == 0.f && g.z == 0.f) return;
+
+    float3 p_up    = make_cam_point(x, y - 1, expected_depth[(y - 1) * W + x], fx, fy, cx, cy);
+    float3 p_down  = make_cam_point(x, y + 1, expected_depth[(y + 1) * W + x], fx, fy, cx, cy);
+    float3 p_left  = make_cam_point(x - 1, y, expected_depth[y * W + (x - 1)], fx, fy, cx, cy);
+    float3 p_right = make_cam_point(x + 1, y, expected_depth[y * W + (x + 1)], fx, fy, cx, cy);
+
+    float3 dx = make_float3(p_down.x - p_up.x, p_down.y - p_up.y, p_down.z - p_up.z);
+    float3 dy = make_float3(p_right.x - p_left.x, p_right.y - p_left.y, p_right.z - p_left.z);
+    float3 raw = cross_loss_f3(dx, dy);
+    float raw_norm_sq = dot_loss_f3(raw, raw);
+    if (raw_norm_sq <= 1e-20f) return;
+
+    float raw_norm = sqrtf(raw_norm_sq);
+    float inv_norm = 1.f / raw_norm;
+    float3 n = make_float3(raw.x * inv_norm, raw.y * inv_norm, raw.z * inv_norm);
+    float proj = dot_loss_f3(n, g);
+    float3 v_raw = make_float3(
+        (g.x - n.x * proj) * inv_norm,
+        (g.y - n.y * proj) * inv_norm,
+        (g.z - n.z * proj) * inv_norm
+    );
+
+    float3 v_dx = cross_loss_f3(dy, v_raw);
+    float3 v_dy = cross_loss_f3(v_raw, dx);
+
+    accum_depth_vjp(x, y + 1, v_dx, fx, fy, cx, cy, v_expected_depth, W);
+    accum_depth_vjp(x, y - 1, make_float3(-v_dx.x, -v_dx.y, -v_dx.z), fx, fy, cx, cy, v_expected_depth, W);
+    accum_depth_vjp(x + 1, y, v_dy, fx, fy, cx, cy, v_expected_depth, W);
+    accum_depth_vjp(x - 1, y, make_float3(-v_dy.x, -v_dy.y, -v_dy.z), fx, fy, cx, cy, v_expected_depth, W);
+}
+
+__global__ void normal_loss_fwd_bwd_kernel(
+    const float* __restrict__ render_normals,
+    const float* __restrict__ surf_normals,
+    const float* __restrict__ render_alpha,
+    float* __restrict__ v_render_normals,
+    float* __restrict__ v_surf_normals,
+    float* __restrict__ normal_error,
+    int pixels,
+    float grad_scale)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pixels) return;
+
+    float alpha = render_alpha[i];
+    float sx = surf_normals[i * 3 + 0] * alpha;
+    float sy = surf_normals[i * 3 + 1] * alpha;
+    float sz = surf_normals[i * 3 + 2] * alpha;
+    float rx = render_normals[i * 3 + 0];
+    float ry = render_normals[i * 3 + 1];
+    float rz = render_normals[i * 3 + 2];
+
+    normal_error[i] = 1.f - (rx * sx + ry * sy + rz * sz);
+    v_render_normals[i * 3 + 0] = -grad_scale * sx;
+    v_render_normals[i * 3 + 1] = -grad_scale * sy;
+    v_render_normals[i * 3 + 2] = -grad_scale * sz;
+    v_surf_normals[i * 3 + 0] = -grad_scale * rx * alpha;
+    v_surf_normals[i * 3 + 1] = -grad_scale * ry * alpha;
+    v_surf_normals[i * 3 + 2] = -grad_scale * rz * alpha;
+}
+
+GeometryLossResult geometry_loss_2dgs(
+    const float* render_depth_accum,
+    const float* render_alpha,
+    const float* render_normals,
+    const float* render_distort,
+    float* grad_render_depth_accum,
+    float* grad_render_alpha,
+    float* grad_render_normals,
+    float* grad_render_distort,
+    GeometryLossWorkspace& ws,
+    int H, int W,
+    float fx, float fy, float cx, float cy,
+    float normal_lambda,
+    float dist_lambda)
+{
+    const int pixels = H * W;
+    const int T = 256;
+    const int B1D = (pixels + T - 1) / T;
+    dim3 blk2d(16, 16);
+    dim3 grd2d((W + 15) / 16, (H + 15) / 16);
+
+    ensure_geometry_loss_workspace(ws, pixels);
+    GeometryLossResult out{};
+
+    if (dist_lambda > 0.f) {
+        CUDA_CHECK(cudaMemset(ws.d_scalar, 0, sizeof(float)));
+        reduce_sum_kernel<<<B1D, T, T*sizeof(float)>>>(render_distort, ws.d_scalar, pixels);
+        CUDA_CHECK(cudaGetLastError());
+        float distort_sum = 0.f;
+        CUDA_CHECK(cudaMemcpy(&distort_sum, ws.d_scalar, sizeof(float), cudaMemcpyDeviceToHost));
+        out.loss_distort = dist_lambda * distort_sum / (float)pixels;
+        fill_kernel<<<B1D, T>>>(grad_render_distort, dist_lambda / (float)pixels, pixels);
+        CUDA_CHECK(cudaGetLastError());
+        out.loss_total += out.loss_distort;
+    }
+
+    if (normal_lambda > 0.f) {
+        expected_depth_fwd_kernel<<<B1D, T>>>(
+            render_depth_accum, render_alpha, ws.d_expected_depth, pixels);
+        CUDA_CHECK(cudaGetLastError());
+
+        depth_to_normal_fwd_kernel<<<grd2d, blk2d>>>(
+            ws.d_expected_depth, ws.d_surf_normals, H, W, fx, fy, cx, cy);
+        CUDA_CHECK(cudaGetLastError());
+
+        normal_loss_fwd_bwd_kernel<<<B1D, T>>>(
+            render_normals, ws.d_surf_normals, render_alpha,
+            grad_render_normals, ws.d_grad_surf_normals, ws.d_normal_error,
+            pixels, normal_lambda / (float)pixels);
+        CUDA_CHECK(cudaGetLastError());
+
+        CUDA_CHECK(cudaMemset(ws.d_scalar, 0, sizeof(float)));
+        reduce_sum_kernel<<<B1D, T, T*sizeof(float)>>>(ws.d_normal_error, ws.d_scalar, pixels);
+        CUDA_CHECK(cudaGetLastError());
+        float normal_sum = 0.f;
+        CUDA_CHECK(cudaMemcpy(&normal_sum, ws.d_scalar, sizeof(float), cudaMemcpyDeviceToHost));
+        out.loss_normal = normal_lambda * normal_sum / (float)pixels;
+        out.loss_total += out.loss_normal;
+
+        CUDA_CHECK(cudaMemset(ws.d_grad_expected_depth, 0, pixels * sizeof(float)));
+        depth_to_normal_bwd_kernel<<<grd2d, blk2d>>>(
+            ws.d_expected_depth, ws.d_grad_surf_normals, ws.d_grad_expected_depth,
+            H, W, fx, fy, cx, cy);
+        CUDA_CHECK(cudaGetLastError());
+
+        expected_depth_bwd_kernel<<<B1D, T>>>(
+            render_depth_accum, render_alpha, ws.d_grad_expected_depth,
+            grad_render_depth_accum, grad_render_alpha, pixels);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     return out;
 }
 

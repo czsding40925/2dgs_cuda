@@ -32,8 +32,12 @@ struct Config {
     int         densify_start = 500;
     int         densify_stop  = 15000;
     int         opacity_reset_every = 3000;
+    float       dist_lambda = 1e-2f;        // 2DGS depth distortion regularizer
+    int         dist_start_iter = 3000;     // enable distortion loss after this iter
+    float       normal_lambda = 5e-2f;      // 2DGS normal consistency regularizer
+    int         normal_start_iter = 7000;   // enable normal loss after this iter
     float       densify_grad_thresh = 0.0f;     // 0 = use adaptive mean-grad heuristic (recommended; fixed values don't transfer across scenes)
-    float       densify_grad_mult   = 2.0f;     // adaptive threshold = mean_grad * this; ~top 30% of Gaussians by gradient
+    float       densify_grad_mult   = 3.0f;     // adaptive threshold = mean_grad * this; ~top 30% of Gaussians by gradient
     float       densify_prune_alpha = 0.005f;   // matches gsplat DefaultStrategy
     float       densify_grow_scale3d = 0.01f;   // normalized by scene scale
     float       densify_prune_scale3d = 0.10f;  // normalized by scene scale
@@ -93,6 +97,14 @@ static Config parse_args(int argc, char** argv) {
             cfg.densify_stop = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--opacity-reset-every") == 0 && i+1 < argc)
             cfg.opacity_reset_every = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--dist-lambda") == 0 && i+1 < argc)
+            cfg.dist_lambda = std::atof(argv[++i]);
+        else if (std::strcmp(argv[i], "--dist-start-iter") == 0 && i+1 < argc)
+            cfg.dist_start_iter = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--normal-lambda") == 0 && i+1 < argc)
+            cfg.normal_lambda = std::atof(argv[++i]);
+        else if (std::strcmp(argv[i], "--normal-start-iter") == 0 && i+1 < argc)
+            cfg.normal_start_iter = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--densify-grad-thresh") == 0 && i+1 < argc)
             cfg.densify_grad_thresh = std::atof(argv[++i]);
         else if (std::strcmp(argv[i], "--densify-grad-mult") == 0 && i+1 < argc)
@@ -116,6 +128,7 @@ static Config parse_args(int argc, char** argv) {
             fprintf(stderr, "             [--preview-every N] [--preview-out prefix]\n");
             fprintf(stderr, "             [--save-ply path] [--save-ply-every N]\n");
             fprintf(stderr, "             [--densify-every N] [--densify-start N] [--densify-stop N]\n");
+            fprintf(stderr, "             [--dist-lambda X] [--dist-start-iter N] [--normal-lambda X] [--normal-start-iter N]\n");
             fprintf(stderr, "             [--opacity-reset-every N] [--densify-grad-thresh X] [--densify-grad-mult X]\n");
             fprintf(stderr, "             [--densify-prune-alpha X] [--densify-grow-scale3d X] [--densify-prune-scale3d X]\n");
             fprintf(stderr, "             [--max-gaussians N]\n");
@@ -164,6 +177,14 @@ static Config parse_args(int argc, char** argv) {
     }
     if (cfg.densify_start < 0 || cfg.densify_stop < 0) {
         fprintf(stderr, "Error: densification iteration bounds must be >= 0\n");
+        exit(1);
+    }
+    if (cfg.dist_lambda < 0.f || cfg.normal_lambda < 0.f) {
+        fprintf(stderr, "Error: geometry regularization weights must be >= 0\n");
+        exit(1);
+    }
+    if (cfg.dist_start_iter < 0 || cfg.normal_start_iter < 0) {
+        fprintf(stderr, "Error: geometry regularization start iterations must be >= 0\n");
         exit(1);
     }
     if (cfg.densify_every > 0 && cfg.densify_stop > 0 && cfg.densify_stop < cfg.densify_start) {

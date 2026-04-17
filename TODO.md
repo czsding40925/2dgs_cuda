@@ -2,59 +2,41 @@
 
 Current state: end-to-end training works on real scenes (garden, bicycle).
 Forward → loss → backward → Adam → densification all wired and producing
-improving renders. Quality is decent but sub-par vs reference; main remaining
-work is the 2DGS-specific regularization losses and longer-run tuning.
+improving renders. Distortion loss, expected-depth normal consistency, and their
+gradient checks are now in place. Quality is decent but still behind reference;
+main remaining work is longer-run tuning and a few parity features.
 
 ---
 
 ## Render quality
 
-### 1. Distortion loss  ← next priority
-**From the 2DGS paper. `dist_lambda=1e-2`, start at iter 3000.**
+### 1. Median-depth parity
+Current normal regularization uses expected depth only. The remaining 2DGS parity
+item is adding median depth / `depth_ratio` support so the rendered normal target
+can interpolate between expected and median depth like the reference.
 
-Penalizes the spread of depth weights along each ray (MipNeRF360 formula).
-Prevents floaters and sharpens depth boundaries.
-
-Formula accumulated per-pixel in the rasterizer inner loop (front-to-back):
-```
-distort += 2 * (vis * depth * (1 - T) - vis * accum_vis_depth)
-accum_vis_depth += vis * depth
-```
-
-What needs to change:
-- `kernels/rasterize_fwd.cu`: load per-Gaussian `depths[]` into shared memory;
-  accumulate `distort` + `accum_vis_depth`; write `render_distort[pix_id]` output
-- `ForwardBuffers` in `train.cu`: add `float* render_distort`
-- `kernels/rasterize_bwd.cu`: backprop `d(distortion)/d(vis_i)` and `d(distortion)/d(depth_i)`
-- `train.cu`: add `dist_lambda * mean(render_distort)` to loss, gated on `iter > 3000`
-
-Reference: `gsplat/gsplat/cuda/csrc/RasterizeToPixels2DGSFwd.cu` lines 205–399
+Reference: `gsplat/examples/simple_trainer_2dgs.py`
 
 ---
 
-### 2. Normal consistency loss
-**From the 2DGS paper. `normal_lambda=5e-2`, start at iter 7000.**
+### 2. Longer-run tuning
+The new regularizers are wired with the standard 2DGS defaults:
+- `dist_lambda=1e-2`, `dist_start_iter=3000`
+- `normal_lambda=5e-2`, `normal_start_iter=7000`
 
-Penalizes inconsistency between Gaussian surface normals and normals estimated
-from the rendered depth gradient. Encourages Gaussians to lie flat on surfaces.
-
-What needs to change:
-- `kernels/rasterize_fwd.cu`: accumulate per-pixel rendered normals (weighted by `vis`);
-  write `render_normals[pix_id * 3]` — same pattern as color accumulation
-- `ForwardBuffers`: add `float* render_normals`, `float* render_depths`
-- `kernels/rasterize_bwd.cu`: backprop normals gradient → `grad_normals[g]`
-- `kernels/projection_2dgs_bwd.cu`: accept `grad_normals`, propagate to rotation/scaling
-- Loss: `normal_error = 1 - dot(render_normals, normals_from_depth_gradient)`;
-  needs a small kernel computing central-difference depth gradients from `render_depths`
-
-Reference: `gsplat/examples/simple_trainer_2dgs.py` lines 616–629
+What remains is empirical tuning on longer runs:
+- check whether `garden` and `bicycle` want the same start iterations
+- verify the current weights versus floaters / over-smoothing tradeoff
+- inspect rendered depth and normals during training, not just RGB
 
 ---
 
-### 3. Gradient check validation
-The backward kernels pass a basic smoke test but haven't been compared
-numerically against gsplat on a shared scene. Worth doing once distortion/normal
-losses are added (they add new gradient paths).
+### 3. Cross-check against reference trainers
+The local finite-difference checks pass, but it is still worth comparing a short
+shared-scene run against `2d-gaussian-splatting` or `gsplat` and checking:
+- loss magnitudes over time
+- rendered normals / depth maps
+- splat-count growth after densification
 
 ---
 
@@ -114,6 +96,9 @@ Requires OptiX 7 SDK and RTX hardware.
 - [x] SH coefficient backward in `train.cu`
 - [x] Adam step wired into the training loop
 - [x] Finite-difference gradient check executable (`make run-gradcheck`)
+- [x] 2DGS distortion loss (`render_distort`, trainer wiring, backward path)
+- [x] 2DGS expected-depth normal consistency loss
+- [x] Finite-difference checks for rasterizer aux buffers and geometry-loss gradients
 - [x] Progress bar and periodic PNG previews in the training loop
 - [x] `SplatData::reserve` and dynamic `N` support in the trainer
 - [x] Densification: prune / clone / split with Adam/buffer remapping
