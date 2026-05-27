@@ -9,12 +9,24 @@ previews/
 # Dataset symlink / raw data
 data
 
+# Profiling / benchmark outputs
+logs/
+*.nsys-rep
+*.ncu-rep
+
 # Python cache
 __pycache__/
 *.pyc
 *.pyo
+.ipynb_checkpoints/
 
 # Editor / OS
 *.swp
 *~
 .DS_Store
+.vscode/
+
+# Local notes, milestone drafts, working TODO (not part of the public codebase)
+docs/
+notes/
+TODO.md

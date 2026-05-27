@@ -69,6 +69,7 @@ struct AdamConfig {
     float lr_rotation = 1.0e-3f;
     float lr_scaling  = 5.0e-3f;
     float lr_opacity  = 5.0e-2f;
+    float lr_gamma    = 1.0e-3f;
     float lr_sh0      = 2.5e-3f;
     float lr_shN      = 1.25e-4f;
 };
@@ -185,6 +186,7 @@ struct SplatGradients {
     float* rotation = nullptr;  // [N, 4]
     float* scaling = nullptr;   // [N, 3]
     float* opacity = nullptr;   // [N]
+    float* gamma = nullptr;     // [N, 2]
     float* sh0 = nullptr;       // [N, 3]
     float* shN = nullptr;       // [N, K*3], optional
 };
@@ -202,6 +204,7 @@ public:
         rotation.allocate(N * 4);
         scaling.allocate(N * 3);
         opacity.allocate(N);
+        gamma.allocate(N * 2);
         sh0.allocate(N * 3);
 
         int shn_dim = sh_coeffs_per_channel(max_sh_degree) * 3;
@@ -220,6 +223,7 @@ public:
         step_group(splats.rotation(), grads.rotation, rotation, _N, 4, cfg.lr_rotation, cfg, d_valid);
         step_group(splats.scaling(),  grads.scaling,  scaling,  _N, 3, cfg.lr_scaling,  cfg, d_valid);
         step_group(splats.opacity(),  grads.opacity,  opacity,  _N, 1, cfg.lr_opacity,  cfg, d_valid);
+        step_group(splats.gamma(),    grads.gamma,    gamma,    _N, 2, cfg.lr_gamma,    cfg, d_valid);
         step_group(splats.sh0(),      grads.sh0,      sh0,      _N, 3, cfg.lr_sh0,      cfg, d_valid);
 
         int shn_dim = sh_coeffs_per_channel(_max_sh_degree) * 3;
@@ -233,6 +237,7 @@ public:
         remap_group(rotation, src_rows, 4);
         remap_group(scaling, src_rows, 3);
         remap_group(opacity, src_rows, 1);
+        remap_group(gamma, src_rows, 2);
         remap_group(sh0, src_rows, 3);
 
         int shn_dim = sh_coeffs_per_channel(_max_sh_degree) * 3;
@@ -242,7 +247,7 @@ public:
         _N = (int)src_rows.size();
     }
 
-    AdamMomentBuffer means, rotation, scaling, opacity, sh0, shN;
+    AdamMomentBuffer means, rotation, scaling, opacity, gamma, sh0, shN;
 
 private:
     int _N = 0;

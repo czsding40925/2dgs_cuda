@@ -45,8 +45,15 @@ def quat_to_rotmat_wxyz(q: np.ndarray) -> np.ndarray:
 
 
 def camera_to_c2w(camera) -> np.ndarray:
+    # viser's camera is OpenGL convention: X right, Y up, -Z forward.
+    # Our projection kernel (train.cu :: projection_2dgs) expects COLMAP /
+    # OpenCV convention: X right, Y down, +Z forward. Flip the Y and Z
+    # columns of the rotation to convert. Without this the camera faces
+    # backward and orbit motion is mirrored relative to per-iter previews.
     c2w = np.eye(4, dtype=np.float32)
     c2w[:3, :3] = quat_to_rotmat_wxyz(np.asarray(camera.wxyz, dtype=np.float32))
+    c2w[:3, 1] *= -1.0
+    c2w[:3, 2] *= -1.0
     c2w[:3, 3] = np.asarray(camera.position, dtype=np.float32)
     return c2w
 
@@ -150,7 +157,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--point-size", type=float, default=0.0025, help="point-cloud overlay size")
     parser.add_argument("--min-alpha", type=float, default=0.02, help="minimum alpha for point-cloud overlay")
     parser.add_argument("--show-point-cloud", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--flip-vertical", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--flip-vertical", action=argparse.BooleanOptionalAction, default=False)
     return parser.parse_args()
 
 

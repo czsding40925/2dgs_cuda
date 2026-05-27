@@ -66,6 +66,21 @@ __global__ void l1_fwd_bwd_kernel(
     grad[i]    = (d > 0.f ? 1.f : (d < 0.f ? -1.f : 0.f)) / (float)N;
 }
 
+// MSE per-element: mse_vals[i] = (a[i]−b[i])^2 / N. Used purely as a
+// metric (PSNR readout); no gradient produced — the optimisation
+// uses L1 + DSSIM only.
+__global__ void mse_fwd_kernel(
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    float*       __restrict__ mse_vals,
+    int N)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    float d = a[i] - b[i];
+    mse_vals[i] = d * d / (float)N;
+}
+
 // Parallel sum reduction via shared memory + atomicAdd
 __global__ void reduce_sum_kernel(const float* in, float* out, int N) {
     extern __shared__ float sdata[];
@@ -223,6 +238,10 @@ struct LossResult {
     float loss_dssim;   // = 1 − mean(SSIM)
     float loss_distort = 0.f;
     float loss_normal = 0.f;
+    // Metric-only fields (not part of the optimisation). PSNR derived
+    // from MSE on host assuming pixel values are in [0, 1].
+    float loss_mse = 0.f;
+    float psnr     = 0.f;
 };
 
 struct LossWorkspace {
@@ -308,6 +327,17 @@ LossResult photometric_loss(
     float loss_l1;
     CUDA_CHECK(cudaMemcpy(&loss_l1, d_scalar, sizeof(float), cudaMemcpyDeviceToHost));
 
+    // ── MSE forward (metric only — no gradient) ─────────────────────────────
+    // Reuse d_l1_vals as scratch: its L1 reduction is already done above and
+    // the values are not needed downstream. PSNR is derived on host below.
+    mse_fwd_kernel<<<B1D, T>>>(render, gt, d_l1_vals, N);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemset(d_scalar, 0, sizeof(float)));
+    reduce_sum_kernel<<<B1D, T, T*sizeof(float)>>>(d_l1_vals, d_scalar, N);
+    CUDA_CHECK(cudaGetLastError());
+    float loss_mse;
+    CUDA_CHECK(cudaMemcpy(&loss_mse, d_scalar, sizeof(float), cudaMemcpyDeviceToHost));
+
     // ── SSIM forward ─────────────────────────────────────────────────────────
     ssim_fwd_kernel<<<grd2d, blk2d>>>(
         render, gt, d_ssim_map,
@@ -352,7 +382,15 @@ LossResult photometric_loss(
         grad_out, N);
     CUDA_CHECK(cudaGetLastError());
 
-    return {(1.f-lambda)*loss_l1 + lambda*loss_dssim, loss_l1, loss_dssim};
+    LossResult out;
+    out.loss       = (1.f - lambda) * loss_l1 + lambda * loss_dssim;
+    out.loss_l1    = loss_l1;
+    out.loss_dssim = loss_dssim;
+    out.loss_mse   = loss_mse;
+    // PSNR for pixel range [0, 1]. Clamp to a very small floor so a
+    // pre-init / cleared render doesn't divide by zero.
+    out.psnr = -10.f * std::log10(loss_mse > 1e-12f ? loss_mse : 1e-12f);
+    return out;
 }
 
 LossResult photometric_loss(
@@ -372,8 +410,10 @@ LossResult photometric_loss(
 
 struct GeometryLossWorkspace {
     float* d_expected_depth = nullptr;
+    float* d_surface_depth  = nullptr;  // = mix(expected, median, depth_ratio)
     float* d_surf_normals = nullptr;
     float* d_grad_expected_depth = nullptr;
+    float* d_grad_surface_depth  = nullptr;
     float* d_grad_surf_normals = nullptr;
     float* d_normal_error = nullptr;
     float* d_scalar = nullptr;
@@ -388,8 +428,10 @@ struct GeometryLossResult {
 
 static void free_geometry_loss_workspace(GeometryLossWorkspace& ws) {
     cudaFree(ws.d_expected_depth);      ws.d_expected_depth = nullptr;
+    cudaFree(ws.d_surface_depth);       ws.d_surface_depth = nullptr;
     cudaFree(ws.d_surf_normals);        ws.d_surf_normals = nullptr;
     cudaFree(ws.d_grad_expected_depth); ws.d_grad_expected_depth = nullptr;
+    cudaFree(ws.d_grad_surface_depth);  ws.d_grad_surface_depth = nullptr;
     cudaFree(ws.d_grad_surf_normals);   ws.d_grad_surf_normals = nullptr;
     cudaFree(ws.d_normal_error);        ws.d_normal_error = nullptr;
     cudaFree(ws.d_scalar);              ws.d_scalar = nullptr;
@@ -398,8 +440,10 @@ static void free_geometry_loss_workspace(GeometryLossWorkspace& ws) {
 
 static void alloc_geometry_loss_workspace(GeometryLossWorkspace& ws, int pixels) {
     CUDA_CHECK(cudaMalloc(&ws.d_expected_depth,      pixels * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ws.d_surface_depth,       pixels * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ws.d_surf_normals,        pixels * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ws.d_grad_expected_depth, pixels * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ws.d_grad_surface_depth,  pixels * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ws.d_grad_surf_normals,   pixels * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ws.d_normal_error,        pixels * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ws.d_scalar,              sizeof(float)));
@@ -445,6 +489,37 @@ __global__ void expected_depth_fwd_kernel(
     if (i >= pixels) return;
     float alpha = render_alpha[i];
     expected_depth[i] = (alpha > 1e-6f) ? (depth_accum[i] / alpha) : 0.f;
+}
+
+// Surface depth = (1 - r) * expected + r * median. Feeds the normal-from-depth
+// path. Median is treated as a stop-gradient (it is a non-differentiable
+// argmax over the per-splat transmittance crossing of 0.5), so its backward
+// kernel just scales dL/dsurface_depth by (1 - r) before routing to
+// dL/dexpected_depth. When r = 0 the kernels collapse to identity and this
+// path is bit-identical to using expected depth directly.
+__global__ void surface_depth_fwd_kernel(
+    const float* __restrict__ expected_depth,
+    const float* __restrict__ median_depth,   // may be nullptr if ratio == 0
+    float ratio,
+    float* __restrict__ surface_depth,
+    int pixels)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pixels) return;
+    float e = expected_depth[i];
+    float m = (median_depth != nullptr) ? median_depth[i] : 0.f;
+    surface_depth[i] = (1.f - ratio) * e + ratio * m;
+}
+
+__global__ void surface_depth_bwd_kernel(
+    const float* __restrict__ v_surface_depth,
+    float ratio,
+    float* __restrict__ v_expected_depth,
+    int pixels)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pixels) return;
+    v_expected_depth[i] = (1.f - ratio) * v_surface_depth[i];
 }
 
 __global__ void expected_depth_bwd_kernel(
@@ -608,6 +683,7 @@ GeometryLossResult geometry_loss_2dgs(
     const float* render_alpha,
     const float* render_normals,
     const float* render_distort,
+    const float* render_median,           // may be nullptr if depth_ratio == 0
     float* grad_render_depth_accum,
     float* grad_render_alpha,
     float* grad_render_normals,
@@ -616,7 +692,8 @@ GeometryLossResult geometry_loss_2dgs(
     int H, int W,
     float fx, float fy, float cx, float cy,
     float normal_lambda,
-    float dist_lambda)
+    float dist_lambda,
+    float depth_ratio)
 {
     const int pixels = H * W;
     const int T = 256;
@@ -644,8 +721,19 @@ GeometryLossResult geometry_loss_2dgs(
             render_depth_accum, render_alpha, ws.d_expected_depth, pixels);
         CUDA_CHECK(cudaGetLastError());
 
+        // Mix in median depth if requested. At depth_ratio == 0 this is a
+        // pure copy and the rest of the path is unchanged.
+        const float* surface_depth_in = ws.d_expected_depth;
+        if (depth_ratio > 0.f) {
+            surface_depth_fwd_kernel<<<B1D, T>>>(
+                ws.d_expected_depth, render_median, depth_ratio,
+                ws.d_surface_depth, pixels);
+            CUDA_CHECK(cudaGetLastError());
+            surface_depth_in = ws.d_surface_depth;
+        }
+
         depth_to_normal_fwd_kernel<<<grd2d, blk2d>>>(
-            ws.d_expected_depth, ws.d_surf_normals, H, W, fx, fy, cx, cy);
+            surface_depth_in, ws.d_surf_normals, H, W, fx, fy, cx, cy);
         CUDA_CHECK(cudaGetLastError());
 
         normal_loss_fwd_bwd_kernel<<<B1D, T>>>(
@@ -662,11 +750,28 @@ GeometryLossResult geometry_loss_2dgs(
         out.loss_normal = normal_lambda * normal_sum / (float)pixels;
         out.loss_total += out.loss_normal;
 
-        CUDA_CHECK(cudaMemset(ws.d_grad_expected_depth, 0, pixels * sizeof(float)));
-        depth_to_normal_bwd_kernel<<<grd2d, blk2d>>>(
-            ws.d_expected_depth, ws.d_grad_surf_normals, ws.d_grad_expected_depth,
-            H, W, fx, fy, cx, cy);
-        CUDA_CHECK(cudaGetLastError());
+        if (depth_ratio > 0.f) {
+            // Backward through depth_to_normal must be evaluated at the same
+            // depth field it saw in forward: surface_depth, not expected.
+            CUDA_CHECK(cudaMemset(ws.d_grad_surface_depth, 0, pixels * sizeof(float)));
+            depth_to_normal_bwd_kernel<<<grd2d, blk2d>>>(
+                ws.d_surface_depth, ws.d_grad_surf_normals, ws.d_grad_surface_depth,
+                H, W, fx, fy, cx, cy);
+            CUDA_CHECK(cudaGetLastError());
+
+            // Stop-gradient on median: dL/dexpected = (1 - r) * dL/dsurface.
+            CUDA_CHECK(cudaMemset(ws.d_grad_expected_depth, 0, pixels * sizeof(float)));
+            surface_depth_bwd_kernel<<<B1D, T>>>(
+                ws.d_grad_surface_depth, depth_ratio,
+                ws.d_grad_expected_depth, pixels);
+            CUDA_CHECK(cudaGetLastError());
+        } else {
+            CUDA_CHECK(cudaMemset(ws.d_grad_expected_depth, 0, pixels * sizeof(float)));
+            depth_to_normal_bwd_kernel<<<grd2d, blk2d>>>(
+                ws.d_expected_depth, ws.d_grad_surf_normals, ws.d_grad_expected_depth,
+                H, W, fx, fy, cx, cy);
+            CUDA_CHECK(cudaGetLastError());
+        }
 
         expected_depth_bwd_kernel<<<B1D, T>>>(
             render_depth_accum, render_alpha, ws.d_grad_expected_depth,

@@ -32,9 +32,18 @@
 #include "kernels/projection_2dgs_bwd.cu"
 #include "kernels/adam.cu"
 #include "kernels/loss.cu"
+// Nexels appearance pipeline (use_nexel). nexel_color.cu sees
+// INCLUDED_AS_HEADER from this scope and skips its own dependency
+// includes, so we pull them in explicitly here.
+#include "kernels/hash_grid.cu"
+#include "kernels/mlp.cu"
+#include "kernels/nexel_color.cu"
 #undef INCLUDED_AS_HEADER
+#include "kernels/appearance_adam.cuh"
 
 #include "kernels/colmap_reader.hpp"
+#include "kernels/profiling.cuh"
+#include "kernels/mpi_comm.cuh"
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -90,10 +99,11 @@ static void print_training_progress(
     int eta_m = (int)(eta_sec / 60.0);
     int eta_s = (int)eta_sec % 60;
 
-    printf("\r[%s] %5d/%d  sh=%d/%d  loss=%.5f  l1=%.5f  dssim=%.5f  dist=%.5f  norm=%.5f  isects=%d  %.2fit/s  eta=%02d:%02d",
+    printf("\r[%s] %5d/%d  sh=%d/%d  loss=%.5f  l1=%.5f  dssim=%.5f  psnr=%.2f  dist=%.5f  norm=%.5f  isects=%d  %.2fit/s  eta=%02d:%02d",
            bar, iter, iters,
            sh_active, sh_max,
-           loss.loss, loss.loss_l1, loss.loss_dssim, loss.loss_distort, loss.loss_normal,
+           loss.loss, loss.loss_l1, loss.loss_dssim, loss.psnr,
+           loss.loss_distort, loss.loss_normal,
            n_isects, iter_per_sec, eta_m, eta_s);
     if (final_line) printf("\n");
     fflush(stdout);
@@ -725,6 +735,7 @@ struct ForwardBuffers {
     float*   render_normals;  // [H*W, 3]
     float*   render_depth_accum; // [H*W]
     float*   render_distort;  // [H*W]
+    float*   render_median;   // [H*W]
     int32_t* last_ids;        // [H*W]
     unsigned char* target_rgb_u8; // [H*W, 3]  staging upload buffer
     float*   target_colors;   // [H*W, 3]  ground-truth RGB
@@ -740,6 +751,7 @@ struct ForwardBuffers {
     // Backward buffers (one per Gaussian)
     float*   grad_ray_transforms; // [N, 9]
     float*   grad_opacity;        // [N]
+    float*   grad_gamma;          // [N, 2]
     float*   grad_colors;         // [N, 3]
     float*   grad_normals;        // [N, 3]
     float*   grad_means2d;        // [N, 2]
@@ -769,6 +781,7 @@ static ForwardBuffers alloc_forward_buffers(int N, int max_pixels, int max_sh_de
     CUDA_CHECK(cudaMalloc(&b.render_normals, max_pixels * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.render_depth_accum, max_pixels * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.render_distort, max_pixels * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&b.render_median,  max_pixels * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.last_ids,       max_pixels     * sizeof(int32_t)));
     CUDA_CHECK(cudaMalloc(&b.target_rgb_u8,  max_pixels * 3 * sizeof(unsigned char)));
     CUDA_CHECK(cudaMalloc(&b.target_colors,  max_pixels * 3 * sizeof(float)));
@@ -780,6 +793,7 @@ static ForwardBuffers alloc_forward_buffers(int N, int max_pixels, int max_sh_de
     CUDA_CHECK(cudaMalloc(&b.viewmat,        16             * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.grad_ray_transforms, N * 9 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.grad_opacity,        N     * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&b.grad_gamma,          N * 2 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.grad_colors,         N * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.grad_normals,        N * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.grad_means2d,        N * 2 * sizeof(float)));
@@ -800,12 +814,14 @@ static void free_forward_buffers(ForwardBuffers& b) {
     cudaFree(b.ray_transforms); cudaFree(b.means2d); cudaFree(b.radii);
     cudaFree(b.depths);         cudaFree(b.normals);  cudaFree(b.colors);
     cudaFree(b.render_colors);  cudaFree(b.render_alphas); cudaFree(b.render_normals);
-    cudaFree(b.render_depth_accum); cudaFree(b.render_distort); cudaFree(b.last_ids);
+    cudaFree(b.render_depth_accum); cudaFree(b.render_distort); cudaFree(b.render_median);
+    cudaFree(b.last_ids);
     cudaFree(b.target_rgb_u8);  cudaFree(b.target_colors);  cudaFree(b.grad_render);
     cudaFree(b.grad_render_alphas); cudaFree(b.grad_render_normals);
     cudaFree(b.grad_render_depth_accum); cudaFree(b.grad_render_distort);
     cudaFree(b.viewmat);
-    cudaFree(b.grad_ray_transforms); cudaFree(b.grad_opacity); cudaFree(b.grad_colors);
+    cudaFree(b.grad_ray_transforms); cudaFree(b.grad_opacity); cudaFree(b.grad_gamma);
+    cudaFree(b.grad_colors);
     cudaFree(b.grad_normals);
     cudaFree(b.grad_means2d); cudaFree(b.grad_means2d_abs);
     cudaFree(b.grad_means); cudaFree(b.grad_rotation); cudaFree(b.grad_scaling);
@@ -944,11 +960,11 @@ static bool render_camera_to_file(
     CUDA_CHECK(cudaMemset(fwd.render_colors, 0, W * H * 3 * sizeof(float)));
     CUDA_CHECK(cudaMemset(fwd.render_alphas, 0, W * H * sizeof(float)));
     launch_rasterize_fwd(
-        fwd.means2d, fwd.ray_transforms, splats.opacity(), fwd.colors, fwd.normals,
+        fwd.means2d, fwd.ray_transforms, splats.opacity(), splats.gamma(), fwd.colors, fwd.normals,
         tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
         W, H,
         fwd.render_colors, fwd.render_alphas,
-        nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr,
         fwd.last_ids
     );
 
@@ -1274,10 +1290,10 @@ static void render_orbit(const Config& cfg, SplatData& splats,
         CUDA_CHECK(cudaMemset(fwd.render_colors, 0, W*H*3*sizeof(float)));
         CUDA_CHECK(cudaMemset(fwd.render_alphas, 0, W*H*sizeof(float)));
         launch_rasterize_fwd(
-            fwd.means2d, fwd.ray_transforms, splats.opacity(), fwd.colors, fwd.normals,
+            fwd.means2d, fwd.ray_transforms, splats.opacity(), splats.gamma(), fwd.colors, fwd.normals,
             tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
             W, H, fwd.render_colors, fwd.render_alphas,
-            nullptr, nullptr, nullptr, fwd.last_ids);
+            nullptr, nullptr, nullptr, nullptr, fwd.last_ids);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         free_tile_intersect_buffers(tile_buf);
@@ -1311,8 +1327,10 @@ static void train(
     const Config& cfg,
     SplatData& splats,
     const ColmapScene& scene,
-    const TrainingImageSet& training_images
+    const TrainingImageSet& training_images,
+    const mpicomm::MpiContext& mpi
 ) {
+    const bool is_root = mpi.is_root();
     const int sh_increase_every = 1000;
     const float scene_scale = compute_scene_scale(scene);
 
@@ -1323,36 +1341,56 @@ static void train(
         max_H = std::max(max_H, cam.K.height);
     }
 
-    printf("\n--- Training ---\n");
-    printf("Iterations  : %d\n", cfg.iters);
-    printf("SH degree   : 0 → %d  (one step every %d iters)\n",
-           cfg.sh_degree, sh_increase_every);
-    printf("Gaussians   : %d\n", splats.N());
-    printf("Scene scale : %.4f\n", scene_scale);
-    printf("Max image   : %ux%u\n", max_W, max_H);
-    printf("Image cache : %s\n", training_images.cached ? "enabled" : "disabled");
-    printf("Log every   : %d\n", cfg.log_every);
-    if (cfg.preview_every > 0)
-        printf("Previews    : every %d iters → %s_XXXXXX.png\n",
-               cfg.preview_every, cfg.preview_out.c_str());
-    if (!cfg.save_ply.empty()) {
-        if (cfg.save_ply_every > 0)
-            printf("Checkpoint  : every %d iters + final → %s\n",
-                   cfg.save_ply_every, cfg.save_ply.c_str());
-        else
-            printf("Checkpoint  : final only → %s\n", cfg.save_ply.c_str());
+    if (is_root) {
+        printf("\n--- Training ---\n");
+        printf("Iterations  : %d\n", cfg.iters);
+        printf("SH degree   : 0 → %d  (one step every %d iters)\n",
+               cfg.sh_degree, sh_increase_every);
+        printf("Gaussians   : %d\n", splats.N());
+        printf("Scene scale : %.4f\n", scene_scale);
+        printf("Max image   : %ux%u\n", max_W, max_H);
+        printf("Image cache : %s\n", training_images.cached ? "enabled" : "disabled");
+        printf("Log every   : %d\n", cfg.log_every);
+        if (mpi.world_size() > 1) {
+            printf("MPI         : world=%d  effective batch=%d  host_stage=%s\n",
+                   mpi.world_size(),
+                   mpi.world_size() * cfg.cameras_per_rank,
+                   cfg.mpi_host_stage ? "on" : "off");
+        }
+        if (cfg.preview_every > 0)
+            printf("Previews    : every %d iters → %s_XXXXXX.png\n",
+                   cfg.preview_every, cfg.preview_out.c_str());
+        if (!cfg.save_ply.empty()) {
+            if (cfg.save_ply_every > 0)
+                printf("Checkpoint  : every %d iters + final → %s\n",
+                       cfg.save_ply_every, cfg.save_ply.c_str());
+            else
+                printf("Checkpoint  : final only → %s\n", cfg.save_ply.c_str());
+        }
+        if (cfg.densify_every > 0)
+            printf("Densify     : every %d iters in [%d, %d]\n",
+                   cfg.densify_every, cfg.densify_start, cfg.densify_stop);
+        if (cfg.opacity_reset_every > 0)
+            printf("Opacity rst : every %d iters  prune_alpha=%.3f  grow_scale=%.4f*scene  prune_scale=%.4f*scene  grad_thresh=%g\n",
+                   cfg.opacity_reset_every, cfg.densify_prune_alpha,
+                   cfg.densify_grow_scale3d, cfg.densify_prune_scale3d,
+                   cfg.densify_grad_thresh);
+        printf("Reg losses  : dist=%.3g@%d  normal=%.3g@%d\n",
+               cfg.dist_lambda, cfg.dist_start_iter,
+               cfg.normal_lambda, cfg.normal_start_iter);
+        if (cfg.profile_iters > 0) {
+            printf("Profile     : iters [%d, %d]%s%s%s%s\n",
+                   cfg.profile_start_iter > 0 ? cfg.profile_start_iter : 1,
+                   (cfg.profile_start_iter > 0 ? cfg.profile_start_iter : 1)
+                       + cfg.profile_iters - 1,
+                   cfg.profile_csv.empty() ? "" : "  csv=",
+                   cfg.profile_csv.empty() ? "" : cfg.profile_csv.c_str(),
+                   cfg.profile_csv.empty() ? "" : "  tag=",
+                   cfg.profile_csv.empty() ? "" : cfg.profile_tag.c_str());
+            if (cfg.profile_exit)
+                printf("              --profile-exit set; training stops at window end\n");
+        }
     }
-    if (cfg.densify_every > 0)
-        printf("Densify     : every %d iters in [%d, %d]\n",
-               cfg.densify_every, cfg.densify_start, cfg.densify_stop);
-    if (cfg.opacity_reset_every > 0)
-        printf("Opacity rst : every %d iters  prune_alpha=%.3f  grow_scale=%.4f*scene  prune_scale=%.4f*scene  grad_thresh=%g\n",
-               cfg.opacity_reset_every, cfg.densify_prune_alpha,
-               cfg.densify_grow_scale3d, cfg.densify_prune_scale3d,
-               cfg.densify_grad_thresh);
-    printf("Reg losses  : dist=%.3g@%d  normal=%.3g@%d\n",
-           cfg.dist_lambda, cfg.dist_start_iter,
-           cfg.normal_lambda, cfg.normal_start_iter);
 
     ForwardBuffers fwd = alloc_forward_buffers(splats.N(), max_W * max_H, splats.max_sh_degree());
     LossWorkspace loss_ws{};
@@ -1363,15 +1401,133 @@ static void train(
     alloc_densify_state(densify, splats.N());
     SplatAdam optimizer(splats);
     AdamConfig opt_cfg;
-    printf("Optimizer   : Adam  lr_xyz=%.2g  lr_opacity=%.2g  lr_sh0=%.2g\n\n",
-           opt_cfg.lr_means, opt_cfg.lr_opacity, opt_cfg.lr_sh0);
+    if (is_root) {
+        printf("Optimizer   : Adam  lr_xyz=%.2g  lr_opacity=%.2g  lr_sh0=%.2g\n\n",
+               opt_cfg.lr_means, opt_cfg.lr_opacity, opt_cfg.lr_sh0);
+    }
 
-    std::mt19937 rng(42);
+    // ── M5: Nexels appearance pipeline (optional, --use-nexel) ───────────
+    // When active, replaces sh_eval / sh_backward with a shared hash grid +
+    // MLP queried per Gaussian. SH parameters stay allocated but receive
+    // no gradient — the trainer's sh0/shN Adam moments simply decay.
+    AppearanceField     af;
+    AppearanceWorkspace appw;
+    AppearanceGrads     appg;
+    AppearanceAdam      appopt;
+    AppearanceAdamConfig appopt_cfg;
+    float3 hash_origin     = make_float3(0.f, 0.f, 0.f);
+    float3 hash_inv_extent = make_float3(1.f, 1.f, 1.f);
+    if (cfg.use_nexel) {
+        int T = 1 << cfg.hash_log_table_size;
+        const int D_out = cfg.nexel_view_dep ? 48 : 3;
+        af.allocate(cfg.hash_levels, T, cfg.hash_features,
+                    cfg.mlp_hidden, D_out,
+                    cfg.hash_min_res, cfg.hash_max_res);
+        af.init_random(cfg.nexel_init_seed);
+        // Toggle the hash-grid backward variant (warp-dedup by default).
+        hash_grid_bwd_use_warp_dedup() = !cfg.hash_bwd_naive;
+        appg.allocate(af);
+        appopt.allocate(af);
+        appopt_cfg.lr_grid        = cfg.lr_grid;
+        appopt_cfg.lr_mlp_weights = cfg.lr_mlp;
+        appopt_cfg.lr_mlp_biases  = cfg.lr_mlp;
+
+        // Bounding-box normalisation: download current Gaussian means and
+        // compute origin/extent on host. Drifted means past the bbox are
+        // soft-clamped to [0, 1] by the normalisation kernel.
+        const int N0 = splats.N();
+        std::vector<float> h_means((size_t)N0 * 3);
+        CUDA_CHECK(cudaMemcpy(h_means.data(), splats.means(),
+                              h_means.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        float pmin[3] = { std::numeric_limits<float>::infinity(),
+                          std::numeric_limits<float>::infinity(),
+                          std::numeric_limits<float>::infinity() };
+        float pmax[3] = { -std::numeric_limits<float>::infinity(),
+                          -std::numeric_limits<float>::infinity(),
+                          -std::numeric_limits<float>::infinity() };
+        for (int i = 0; i < N0; i++) {
+            for (int d = 0; d < 3; d++) {
+                float v = h_means[(size_t)i * 3 + d];
+                if (v < pmin[d]) pmin[d] = v;
+                if (v > pmax[d]) pmax[d] = v;
+            }
+        }
+        // 5% margin so points on the bbox face don't trip the clamp.
+        for (int d = 0; d < 3; d++) {
+            float ext = std::max(1e-3f, pmax[d] - pmin[d]);
+            pmin[d] -= 0.05f * ext;
+            pmax[d] += 0.05f * ext;
+        }
+        hash_origin = make_float3(pmin[0], pmin[1], pmin[2]);
+        hash_inv_extent = make_float3(
+            1.f / std::max(1e-6f, pmax[0] - pmin[0]),
+            1.f / std::max(1e-6f, pmax[1] - pmin[1]),
+            1.f / std::max(1e-6f, pmax[2] - pmin[2]));
+
+        if (is_root) {
+            const size_t pf = af.total_param_floats();
+            printf("Nexel       : ON  L=%d T=2^%d F=%d  D_hid=%d  D_out=%d%s  params=%.2f MB\n",
+                   cfg.hash_levels, cfg.hash_log_table_size, cfg.hash_features,
+                   cfg.mlp_hidden, af.D_out,
+                   af.view_dep ? " [view-dep SH]" : "",
+                   (double)pf * sizeof(float) / (1024.0 * 1024.0));
+            printf("              hash bbox: min=(%.3f, %.3f, %.3f) max=(%.3f, %.3f, %.3f)\n",
+                   pmin[0], pmin[1], pmin[2], pmax[0], pmax[1], pmax[2]);
+            printf("              lr_grid=%.2g  lr_mlp=%.2g  init_seed=%llu\n\n",
+                   appopt_cfg.lr_grid, appopt_cfg.lr_mlp_weights,
+                   (unsigned long long)cfg.nexel_init_seed);
+        }
+    }
+
+    // Shared RNG across all MPI ranks. With np=1 and cameras_per_rank=1 this
+    // draws exactly one camera index per iter, byte-identical to the
+    // single-process train binary's `mt19937(42)` sequence (provided
+    // --seed 42 is left as the default). With np>1 every rank draws the
+    // same K=world_size indices in lock-step, and each rank reads slot
+    // [rank]. No per-iter broadcast is required.
+    std::mt19937 rng(cfg.seed);
     std::uniform_int_distribution<int> cam_dist(0, (int)scene.cameras.size() - 1);
+    std::vector<int> iter_cams(mpi.world_size());
+
+    // If cameras_per_rank > 1 the trainer would need an inner per-camera
+    // accumulation loop before the allreduce. Land that later if a strong
+    // scaling experiment motivates it; for now hold at 1 so the report's
+    // "1 fused allreduce per iter" story stays clean.
+    if (cfg.cameras_per_rank != 1) {
+        if (is_root)
+            fprintf(stderr,
+                "Error: --cameras-per-rank > 1 is not yet implemented (got %d)\n",
+                cfg.cameras_per_rank);
+        mpi.abort(4);
+    }
 
     auto train_start = std::chrono::steady_clock::now();
 
+    // Profile window bookkeeping. See notes/perf_plan.md.
+    const bool profile_enabled = cfg.profile_iters > 0;
+    const int  profile_first_iter = cfg.profile_start_iter > 0
+                                        ? cfg.profile_start_iter : 1;
+    const int  profile_last_iter  = profile_first_iter + cfg.profile_iters - 1;
+    uint32_t profile_last_W = 0, profile_last_H = 0;
+    bool     profile_finished = false;
+    bool     nvtx_window_open = false;
+
     for (int iter = 1; iter <= cfg.iters; iter++) {
+
+        // Profile window: enable timers + open a top-level NVTX range so nsys
+        // can be invoked with --capture-range=nvtx --nvtx-capture=profile_window.
+        if (profile_enabled && !profile_finished) {
+            const bool in_window = iter >= profile_first_iter
+                                && iter <= profile_last_iter;
+            prof::registry().enabled = in_window;
+            if (in_window && !nvtx_window_open) {
+#if PROFILE_HAS_NVTX
+                nvtxRangePushA("profile_window");
+#endif
+                nvtx_window_open = true;
+                prof::registry().N_start = splats.N();
+            }
+        }
 
         // ── SH curriculum ────────────────────────────────────────────────────
         if (iter % sh_increase_every == 0)
@@ -1379,7 +1535,12 @@ static void train(
 
         // ── Pick a training camera ────────────────────────────────────────────
         const int N = splats.N();
-        int cam_idx = cam_dist(rng);
+        // Lock-step draw: every rank consumes world_size indices, then picks
+        // its own slot. Bit-identical to the single-process trainer when
+        // world_size == 1.
+        for (int r = 0; r < mpi.world_size(); r++)
+            iter_cams[r] = cam_dist(rng);
+        int cam_idx = iter_cams[mpi.rank()];
         const CameraInfo& cam = scene.cameras[cam_idx];
         const uint32_t W = cam.K.width;
         const uint32_t H = cam.K.height;
@@ -1391,8 +1552,22 @@ static void train(
         c2w_to_w2c(cam.camtoworld, h_w2c);
         CUDA_CHECK(cudaMemcpy(fwd.viewmat, h_w2c, 16*sizeof(float), cudaMemcpyHostToDevice));
 
-        // ── Full SH evaluation: view-dependent color per Gaussian ─────────────
-        {
+        // ── Per-Gaussian colour: SH (default) or Nexels (--use-nexel) ─────────
+        if (cfg.use_nexel) {
+            PROFILE_SCOPE("nexel_color_fwd");
+            appw.ensure(N, af.D_in, af.D_hid, af.D_out);
+            launch_nexel_normalize_positions(
+                splats.means(), hash_origin, hash_inv_extent,
+                appw.normalized_means, N);
+            const float cam_px = cam.camtoworld[0][3];
+            const float cam_py = cam.camtoworld[1][3];
+            const float cam_pz = cam.camtoworld[2][3];
+            nexel_color_forward(
+                splats.means(), af, appw, appw.normalized_means,
+                fwd.colors, N,
+                cam_px, cam_py, cam_pz);
+        } else {
+            PROFILE_SCOPE("sh_eval");
             float cam_px = cam.camtoworld[0][3];
             float cam_py = cam.camtoworld[1][3];
             float cam_pz = cam.camtoworld[2][3];
@@ -1406,6 +1581,7 @@ static void train(
 
         // ── Step 1: Projection ────────────────────────────────────────────────
         {
+            PROFILE_SCOPE("projection_fwd");
             int blocks = (N + 255) / 256;
             projection_2dgs_kernel<<<blocks, 256>>>(
                 splats.means(), splats.rotation(), splats.scaling(), fwd.viewmat,
@@ -1417,7 +1593,7 @@ static void train(
             CUDA_CHECK(cudaGetLastError());
         }
 
-        if (iter == 1) {
+        if (iter == 1 && is_root) {
             std::vector<int32_t> h_radii(N * 2);
             CUDA_CHECK(cudaMemcpy(h_radii.data(), fwd.radii,
                                   N * 2 * sizeof(int32_t), cudaMemcpyDeviceToHost));
@@ -1441,46 +1617,71 @@ static void train(
         }
 
         // ── Step 2: Tile intersection ─────────────────────────────────────────
-        TileIntersectBuffers tile_buf = launch_tile_intersect(
-            fwd.means2d, fwd.radii, fwd.depths, N, W, H, TILE_SIZE);
+        TileIntersectBuffers tile_buf{};
+        {
+            PROFILE_SCOPE("tile_intersect");
+            tile_buf = launch_tile_intersect(
+                fwd.means2d, fwd.radii, fwd.depths, N, W, H, TILE_SIZE);
+        }
 
         // ── Step 3: Rasterize ─────────────────────────────────────────────────
-        CUDA_CHECK(cudaMemset(fwd.render_colors, 0, W*H*3*sizeof(float)));
-        CUDA_CHECK(cudaMemset(fwd.render_alphas, 0, W*H*sizeof(float)));
-        CUDA_CHECK(cudaMemset(fwd.render_normals, 0, W*H*3*sizeof(float)));
-        CUDA_CHECK(cudaMemset(fwd.render_depth_accum, 0, W*H*sizeof(float)));
-        CUDA_CHECK(cudaMemset(fwd.render_distort, 0, W*H*sizeof(float)));
+        {
+            PROFILE_SCOPE("clear_fwd");
+            CUDA_CHECK(cudaMemset(fwd.render_colors, 0, W*H*3*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.render_alphas, 0, W*H*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.render_normals, 0, W*H*3*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.render_depth_accum, 0, W*H*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.render_distort, 0, W*H*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.render_median,  0, W*H*sizeof(float)));
+        }
 
-        launch_rasterize_fwd(
-            fwd.means2d, fwd.ray_transforms, splats.opacity(), fwd.colors, fwd.normals,
-            tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
-            W, H,
-            fwd.render_colors, fwd.render_alphas, fwd.render_normals,
-            fwd.render_depth_accum, fwd.render_distort, fwd.last_ids
-        );
+        // Only request median depth from the rasterizer when the geometry
+        // loss will actually mix it in — saves a per-pixel write on most runs
+        // where depth_ratio is 0 (the current default).
+        const bool need_median =
+            cfg.depth_ratio > 0.f && (iter > cfg.normal_start_iter);
+        {
+            PROFILE_SCOPE("rasterize_fwd");
+            launch_rasterize_fwd(
+                fwd.means2d, fwd.ray_transforms, splats.opacity(), splats.gamma(), fwd.colors, fwd.normals,
+                tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
+                W, H,
+                fwd.render_colors, fwd.render_alphas, fwd.render_normals,
+                fwd.render_depth_accum, fwd.render_distort,
+                need_median ? fwd.render_median : nullptr,
+                fwd.last_ids
+            );
+        }
 
-        LossResult loss = photometric_loss(
-            fwd.render_colors, fwd.target_colors, fwd.grad_render, loss_ws,
-            (int)H, (int)W, 0.2f, 3);
-        CUDA_CHECK(cudaMemset(fwd.grad_render_alphas, 0, W*H*sizeof(float)));
-        CUDA_CHECK(cudaMemset(fwd.grad_render_normals, 0, W*H*3*sizeof(float)));
-        CUDA_CHECK(cudaMemset(fwd.grad_render_depth_accum, 0, W*H*sizeof(float)));
-        CUDA_CHECK(cudaMemset(fwd.grad_render_distort, 0, W*H*sizeof(float)));
+        LossResult loss;
+        {
+            PROFILE_SCOPE("photometric_loss");
+            loss = photometric_loss(
+                fwd.render_colors, fwd.target_colors, fwd.grad_render, loss_ws,
+                (int)H, (int)W, 0.2f, 3);
+            CUDA_CHECK(cudaMemset(fwd.grad_render_alphas, 0, W*H*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.grad_render_normals, 0, W*H*3*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.grad_render_depth_accum, 0, W*H*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.grad_render_distort, 0, W*H*sizeof(float)));
+        }
 
         const float dist_lambda =
             (iter > cfg.dist_start_iter) ? cfg.dist_lambda : 0.f;
         const float normal_lambda =
             (iter > cfg.normal_start_iter) ? cfg.normal_lambda : 0.f;
         if (dist_lambda > 0.f || normal_lambda > 0.f) {
+            PROFILE_SCOPE("geometry_loss");
             GeometryLossResult geom = geometry_loss_2dgs(
                 fwd.render_depth_accum, fwd.render_alphas,
                 fwd.render_normals, fwd.render_distort,
+                need_median ? fwd.render_median : nullptr,
                 fwd.grad_render_depth_accum, fwd.grad_render_alphas,
                 fwd.grad_render_normals, fwd.grad_render_distort,
                 geom_ws,
                 (int)H, (int)W,
                 cam.K.fx, cam.K.fy, cam.K.cx, cam.K.cy,
-                normal_lambda, dist_lambda
+                normal_lambda, dist_lambda,
+                cfg.depth_ratio
             );
             loss.loss += geom.loss_total;
             loss.loss_distort = geom.loss_distort;
@@ -1488,42 +1689,65 @@ static void train(
         }
 
         // ── Backward pass ────────────────────────────────────────────────────
-        CUDA_CHECK(cudaMemset(fwd.grad_ray_transforms, 0, N*9*sizeof(float)));
-        CUDA_CHECK(cudaMemset(fwd.grad_opacity,        0, N*sizeof(float)));
-        CUDA_CHECK(cudaMemset(fwd.grad_colors,         0, N*3*sizeof(float)));
-        CUDA_CHECK(cudaMemset(fwd.grad_normals,        0, N*3*sizeof(float)));
-        CUDA_CHECK(cudaMemset(fwd.grad_means2d,        0, N*2*sizeof(float)));
-        CUDA_CHECK(cudaMemset(fwd.grad_means2d_abs,    0, N*2*sizeof(float)));
-        CUDA_CHECK(cudaMemset(fwd.grad_means,          0, N*3*sizeof(float)));
-        CUDA_CHECK(cudaMemset(fwd.grad_rotation,       0, N*4*sizeof(float)));
-        CUDA_CHECK(cudaMemset(fwd.grad_scaling,        0, N*3*sizeof(float)));
-        CUDA_CHECK(cudaMemset(fwd.grad_sh0,            0, N*3*sizeof(float)));
-        if (fwd.shN_numel > 0)
-            CUDA_CHECK(cudaMemset(fwd.grad_shN, 0, fwd.shN_numel*sizeof(float)));
-
-        launch_rasterize_bwd(
-            fwd.means2d, fwd.ray_transforms, splats.opacity(), fwd.colors, fwd.normals,
-            tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
-            fwd.render_alphas, fwd.render_depth_accum, fwd.last_ids,
-            fwd.grad_render, fwd.grad_render_alphas,
-            fwd.grad_render_normals, fwd.grad_render_depth_accum,
-            fwd.grad_render_distort,
-            W, H,
-            fwd.grad_ray_transforms, fwd.grad_opacity, fwd.grad_colors, fwd.grad_normals,
-            fwd.grad_means2d, fwd.grad_means2d_abs
-        );
-
-        launch_projection_2dgs_bwd(
-            splats.means(), splats.rotation(), splats.scaling(), fwd.viewmat,
-            cam.K.fx, cam.K.fy, cam.K.cx, cam.K.cy,
-            fwd.ray_transforms, fwd.radii,
-            fwd.grad_ray_transforms, fwd.grad_means2d,
-            /*d_v_depths=*/nullptr, fwd.grad_normals,
-            fwd.grad_means, fwd.grad_rotation, fwd.grad_scaling,
-            N
-        );
+        {
+            PROFILE_SCOPE("clear_bwd");
+            CUDA_CHECK(cudaMemset(fwd.grad_ray_transforms, 0, N*9*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.grad_opacity,        0, N*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.grad_gamma,          0, N*2*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.grad_colors,         0, N*3*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.grad_normals,        0, N*3*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.grad_means2d,        0, N*2*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.grad_means2d_abs,    0, N*2*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.grad_means,          0, N*3*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.grad_rotation,       0, N*4*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.grad_scaling,        0, N*3*sizeof(float)));
+            CUDA_CHECK(cudaMemset(fwd.grad_sh0,            0, N*3*sizeof(float)));
+            if (fwd.shN_numel > 0)
+                CUDA_CHECK(cudaMemset(fwd.grad_shN, 0, fwd.shN_numel*sizeof(float)));
+        }
 
         {
+            PROFILE_SCOPE("rasterize_bwd");
+            launch_rasterize_bwd(
+                fwd.means2d, fwd.ray_transforms, splats.opacity(), splats.gamma(),
+                fwd.colors, fwd.normals,
+                tile_buf.tile_offsets, tile_buf.flatten_ids, tile_buf.n_isects,
+                fwd.render_alphas, fwd.render_depth_accum, fwd.last_ids,
+                fwd.grad_render, fwd.grad_render_alphas,
+                fwd.grad_render_normals, fwd.grad_render_depth_accum,
+                fwd.grad_render_distort,
+                W, H,
+                fwd.grad_ray_transforms, fwd.grad_opacity, fwd.grad_gamma,
+                fwd.grad_colors, fwd.grad_normals,
+                fwd.grad_means2d, fwd.grad_means2d_abs
+            );
+        }
+
+        {
+            PROFILE_SCOPE("projection_bwd");
+            launch_projection_2dgs_bwd(
+                splats.means(), splats.rotation(), splats.scaling(), fwd.viewmat,
+                cam.K.fx, cam.K.fy, cam.K.cx, cam.K.cy,
+                fwd.ray_transforms, fwd.radii,
+                fwd.grad_ray_transforms, fwd.grad_means2d,
+                /*d_v_depths=*/nullptr, fwd.grad_normals,
+                fwd.grad_means, fwd.grad_rotation, fwd.grad_scaling,
+                N
+            );
+        }
+
+        if (cfg.use_nexel) {
+            PROFILE_SCOPE("nexel_color_bwd");
+            appg.zero_params();
+            const float cam_px = cam.camtoworld[0][3];
+            const float cam_py = cam.camtoworld[1][3];
+            const float cam_pz = cam.camtoworld[2][3];
+            nexel_color_backward(
+                splats.means(), af, appw, appw.normalized_means,
+                fwd.grad_colors, appg, N,
+                cam_px, cam_py, cam_pz);
+        } else {
+            PROFILE_SCOPE("sh_bwd");
             float cam_px = cam.camtoworld[0][3];
             float cam_py = cam.camtoworld[1][3];
             float cam_pz = cam.camtoworld[2][3];
@@ -1537,7 +1761,67 @@ static void train(
             CUDA_CHECK(cudaGetLastError());
         }
 
+        // ── MPI: all-reduce per-Gaussian gradients across ranks ──────────────
+        // SUM then divide by world_size → gradient becomes the per-camera
+        // mean over the world_size cameras processed this iter. At
+        // world_size==1 both calls are no-ops (allreduce uses a 1-rank
+        // communicator, scale uses scale=1.f).
+        if (mpi.world_size() > 1) {
+            PROFILE_SCOPE("mpi_allreduce");
+            const std::size_t Ns = (std::size_t)N;
+            const float invK = 1.f / (float)mpi.world_size();
+            const bool host_stage = cfg.mpi_host_stage;
+            mpicomm::allreduce_sum_inplace_device_float(fwd.grad_means,    Ns*3, host_stage);
+            mpicomm::allreduce_sum_inplace_device_float(fwd.grad_rotation, Ns*4, host_stage);
+            mpicomm::allreduce_sum_inplace_device_float(fwd.grad_scaling,  Ns*3, host_stage);
+            mpicomm::allreduce_sum_inplace_device_float(fwd.grad_opacity,  Ns,   host_stage);
+            mpicomm::allreduce_sum_inplace_device_float(fwd.grad_gamma,    Ns*2, host_stage);
+            mpicomm::allreduce_sum_inplace_device_float(fwd.grad_sh0,      Ns*3, host_stage);
+            if (fwd.shN_numel > 0)
+                mpicomm::allreduce_sum_inplace_device_float(fwd.grad_shN,
+                    (std::size_t)fwd.shN_numel, host_stage);
+            mpicomm::scale_inplace_device_float(fwd.grad_means,    Ns*3, invK);
+            mpicomm::scale_inplace_device_float(fwd.grad_rotation, Ns*4, invK);
+            mpicomm::scale_inplace_device_float(fwd.grad_scaling,  Ns*3, invK);
+            mpicomm::scale_inplace_device_float(fwd.grad_opacity,  Ns,   invK);
+            mpicomm::scale_inplace_device_float(fwd.grad_gamma,    Ns*2, invK);
+            mpicomm::scale_inplace_device_float(fwd.grad_sh0,      Ns*3, invK);
+            if (fwd.shN_numel > 0)
+                mpicomm::scale_inplace_device_float(fwd.grad_shN,
+                    (std::size_t)fwd.shN_numel, invK);
+
+            // Appearance-field gradients (only when --use-nexel). The
+            // hash-grid gradient is the largest single per-iter payload
+            // by a wide margin (L*T*F floats ≈ 64 MB at the default
+            // L=16, T=2^19, F=2 — predicted to dominate in
+            // docs/M2_design.md §5). The MLP grads are ~10 KB total.
+            if (cfg.use_nexel) {
+                const std::size_t grid_n  = (std::size_t)af.L * af.T * af.F;
+                const std::size_t w1_n    = (std::size_t)af.D_hid * af.D_in;
+                const std::size_t b1_n    = (std::size_t)af.D_hid;
+                const std::size_t w2_n    = (std::size_t)af.D_out * af.D_hid;
+                const std::size_t b2_n    = (std::size_t)af.D_out;
+                mpicomm::allreduce_sum_inplace_device_float(appg.grad_grid, grid_n, host_stage);
+                mpicomm::allreduce_sum_inplace_device_float(appg.grad_W1,   w1_n,   host_stage);
+                mpicomm::allreduce_sum_inplace_device_float(appg.grad_b1,   b1_n,   host_stage);
+                mpicomm::allreduce_sum_inplace_device_float(appg.grad_W2,   w2_n,   host_stage);
+                mpicomm::allreduce_sum_inplace_device_float(appg.grad_b2,   b2_n,   host_stage);
+                mpicomm::scale_inplace_device_float(appg.grad_grid, grid_n, invK);
+                mpicomm::scale_inplace_device_float(appg.grad_W1,   w1_n,   invK);
+                mpicomm::scale_inplace_device_float(appg.grad_b1,   b1_n,   invK);
+                mpicomm::scale_inplace_device_float(appg.grad_W2,   w2_n,   invK);
+                mpicomm::scale_inplace_device_float(appg.grad_b2,   b2_n,   invK);
+            }
+
+            // Note: densify accumulators (grad_means2d_abs → densify.grad_accum,
+            // radii → densify.count) are intentionally NOT allreduced per-iter.
+            // They are accumulated rank-local across the densify_every window
+            // and allreduced once just before maybe_densify fires — same
+            // global decision, world_size× less comm.
+        }
+
         {
+            PROFILE_SCOPE("densify_accum");
             int blocks = (N + 255) / 256;
             accumulate_grad_means2d_abs_kernel<<<blocks, 256>>>(
                 fwd.grad_means2d_abs, densify.grad_accum, N);
@@ -1564,13 +1848,66 @@ static void train(
             fwd.grad_rotation,
             fwd.grad_scaling,
             fwd.grad_opacity,
+            fwd.grad_gamma,
             fwd.grad_sh0,
             fwd.grad_shN
         };
-        optimizer.step(splats, grads, opt_cfg);
+        {
+            PROFILE_SCOPE("adam_step");
+            optimizer.step(splats, grads, opt_cfg);
+        }
+        if (cfg.use_nexel) {
+            PROFILE_SCOPE("nexel_adam_step");
+            appopt.step(af, appg, appopt_cfg);
+        }
 
-        // ── Optional preview snapshot ────────────────────────────────────────
-        if (cfg.preview_every > 0 &&
+        // ── Profile window end-of-iter flush ─────────────────────────────────
+        // Convert this iter's submitted cudaEvent pairs into per-bucket
+        // accumulated stats. Stamps N + WxH for the CSV. One sync per iter
+        // when profiling is active; zero-cost otherwise.
+        if (prof::registry().enabled) {
+            profile_last_W = W;
+            profile_last_H = H;
+            prof::registry().N_end = splats.N();
+            prof::registry().flush_iter();
+        }
+        if (profile_enabled && !profile_finished && iter == profile_last_iter) {
+            if (nvtx_window_open) {
+#if PROFILE_HAS_NVTX
+                nvtxRangePop();
+#endif
+                nvtx_window_open = false;
+            }
+            // Every rank dumps its own summary so multi-rank runs can show
+            // per-rank timing (useful for load-balance diagnostics). Prefix
+            // each line with the rank id when world_size > 1.
+            if (mpi.world_size() > 1)
+                printf("[rank %d]\n", mpi.rank());
+            prof::registry().print_summary(stdout);
+            if (is_root && !cfg.profile_csv.empty()) {
+                prof::registry().append_csv(cfg.profile_csv, cfg.profile_tag,
+                                            (int)profile_last_W, (int)profile_last_H);
+                printf("[profile] appended %s (tag=%s)\n",
+                       cfg.profile_csv.c_str(), cfg.profile_tag.c_str());
+            }
+            prof::registry().enabled = false;
+            profile_finished = true;
+            if (cfg.profile_exit) {
+                if (is_root && !cfg.save_ply.empty()) {
+                    bool ok = save_ply_checkpoint_atomic(splats, cfg.save_ply);
+                    printf("[profile] saved checkpoint to %s (N=%d)%s\n",
+                           cfg.save_ply.c_str(), splats.N(),
+                           ok ? "" : "  [WRITE FAILED]");
+                }
+                if (is_root)
+                    printf("[profile] --profile-exit set; stopping after iter %d\n",
+                           iter);
+                break;
+            }
+        }
+
+        // ── Optional preview snapshot (rank-0 only) ──────────────────────────
+        if (is_root && cfg.preview_every > 0 &&
             (iter % cfg.preview_every == 0 || iter == 1 || iter == cfg.iters)) {
             char fname[1024];
             snprintf(fname, sizeof(fname), "%s_%06d.png", cfg.preview_out.c_str(), iter);
@@ -1579,13 +1916,36 @@ static void train(
                    iter, cam_idx, loss.loss, fname, ok ? "" : "  [WRITE FAILED]");
         }
 
+        // ── MPI: sync densify accumulators before the firing iter ────────────
+        // Every rank accumulates its own grad_accum + count across the
+        // densify_every window; just before maybe_densify runs we SUM both
+        // across ranks so all replicas reach the same prune/clone/split
+        // decision. No /world_size divide — counts and gradient sums are
+        // additive quantities here, not per-camera means.
+        const bool will_densify =
+            (cfg.densify_every > 0) &&
+            (iter >= cfg.densify_start) &&
+            (cfg.densify_stop <= 0 || iter <= cfg.densify_stop) &&
+            (iter % cfg.densify_every == 0) &&
+            (densify.accum_steps > 0);
+        if (mpi.world_size() > 1 && will_densify) {
+            PROFILE_SCOPE("mpi_allreduce_densify");
+            mpicomm::allreduce_sum_inplace_device_float(densify.grad_accum,
+                (std::size_t)splats.N(), cfg.mpi_host_stage);
+            mpicomm::allreduce_sum_inplace_device_int(densify.count,
+                (std::size_t)splats.N(), cfg.mpi_host_stage);
+        }
+
         // ── Basic densification ──────────────────────────────────────────────
+        // Deterministic given (splats, densify.grad_accum, densify.count) —
+        // all of which are identical across ranks after the syncs above.
         maybe_densify(cfg, iter, scene_scale, splats, optimizer, fwd, densify, max_W * max_H);
         maybe_reset_opacity(cfg, iter, splats, optimizer);
-        maybe_save_ply_checkpoint(cfg, iter, iter == cfg.iters, splats);
+        if (is_root)
+            maybe_save_ply_checkpoint(cfg, iter, iter == cfg.iters, splats);
 
-        // ── Progress log ─────────────────────────────────────────────────────
-        if (iter % cfg.log_every == 0 || iter == 1 || iter == cfg.iters) {
+        // ── Progress log (rank-0 only) ───────────────────────────────────────
+        if (is_root && (iter % cfg.log_every == 0 || iter == 1 || iter == cfg.iters)) {
             double elapsed_sec =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - train_start).count();
             print_training_progress(
@@ -1599,7 +1959,7 @@ static void train(
         }
     }
 
-    if (cfg.iters % cfg.log_every != 0) printf("\n");
+    if (is_root && cfg.iters % cfg.log_every != 0) printf("\n");
 
     free_forward_buffers(fwd);
     free_loss_workspace(loss_ws);
@@ -1614,6 +1974,19 @@ static void train(
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);  // unbuffered stdout for debugger
 
+    // MpiContext init must precede any CUDA allocation: it picks the CUDA
+    // device per rank. In the non-MPI build (no -DUSE_MPI) it is a no-op
+    // singleton — rank=0, world_size=1, no MPI_Init call.
+    mpicomm::MpiContext mpi(&argc, &argv);
+    int chosen_device = mpicomm::select_device_for_rank(mpi.rank());
+    const bool is_root = mpi.is_root();
+    if (mpi.world_size() > 1 && is_root) {
+        printf("MPI initialised: world=%d  device=rank %% n_devices\n",
+               mpi.world_size());
+    }
+    if (mpi.world_size() > 1)
+        printf("[rank %d] bound to CUDA device %d\n", mpi.rank(), chosen_device);
+
     Config cfg = parse_args(argc, argv);
 
     ColmapScene scene;
@@ -1626,8 +1999,22 @@ int main(int argc, char** argv) {
     const bool needs_training_images =
         cfg.render_out.empty() && cfg.orbit_frames == 0 && !cfg.serve_render;
 
+    // Render / orbit / serve modes are single-process only — they write to
+    // a single file and do not benefit from data-parallel ranks.
+    const bool is_training_mode = needs_training_images;
+    if (!is_training_mode && mpi.world_size() > 1) {
+        if (is_root) {
+            fprintf(stderr,
+                "Error: --render / --orbit / --serve-render are single-process modes; "
+                "do not launch them under mpirun (got world_size=%d)\n",
+                mpi.world_size());
+        }
+        mpi.abort(5);
+    }
+
     if (needs_scene) {
-        printf("Loading COLMAP scene from: %s\n", cfg.data_dir.c_str());
+        if (is_root)
+            printf("Loading COLMAP scene from: %s\n", cfg.data_dir.c_str());
         try {
             scene = load_colmap(cfg.data_dir, cfg.images);
             if (needs_training_images) {
@@ -1642,21 +2029,24 @@ int main(int argc, char** argv) {
             fprintf(stderr, "Error preparing scene/images: %s\n", e.what());
             return 1;
         }
-        print_scene_summary(scene);
+        if (is_root)
+            print_scene_summary(scene);
     }
 
     SplatData splats(0, cfg.sh_degree);
 
     if (!cfg.ply_path.empty()) {
         // ── Load trained checkpoint ───────────────────────────────────────────
-        printf("\nLoading PLY checkpoint: %s\n", cfg.ply_path.c_str());
+        if (is_root)
+            printf("\nLoading PLY checkpoint: %s\n", cfg.ply_path.c_str());
         try {
             splats.init_from_ply(cfg.ply_path, cfg.sh_degree);
         } catch (const std::exception& e) {
             fprintf(stderr, "Error loading PLY: %s\n", e.what());
             return 1;
         }
-        splats.print_summary();
+        if (is_root)
+            splats.print_summary();
     } else {
         // ── Initialize from COLMAP point cloud ────────────────────────────────
         if (!needs_scene) {
@@ -1677,9 +2067,11 @@ int main(int argc, char** argv) {
             rgb[i*3+1] = scene.point_colors[i].y;
             rgb[i*3+2] = scene.point_colors[i].z;
         }
-        printf("\nInitializing %d Gaussians...\n", M);
+        if (is_root)
+            printf("\nInitializing %d Gaussians...\n", M);
         splats.init_from_points(xyz.data(), rgb.data(), M);
-        splats.print_summary();
+        if (is_root)
+            splats.print_summary();
     }
 
     if (cfg.serve_render) {
@@ -1706,8 +2098,9 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    train(cfg, splats, scene, training_images);
+    train(cfg, splats, scene, training_images, mpi);
 
-    printf("\nDone.\n");
+    if (is_root)
+        printf("\nDone.\n");
     return 0;
 }

@@ -19,10 +19,13 @@
 //     (where ra = 1/(1-alpha_i))
 //     buffer[c] += c_i[c] * fac   // updated AFTER gradient
 //
-//   Case 1 — 3D Gaussian kernel active (gauss_3d <= gauss_2d):
-//     v_G = opac * v_alpha        (d(alpha)/d(vis) = opac)
-//     v_s = -vis * v_G * [u, v]   (d(vis)/d(u²+v²) → chain through sigma)
-//     → v_ray_transforms via cross-product chain rule
+//   Case 1 — 3D super-Gaussian kernel active (gauss_3d <= gauss_2d):
+//     gauss_3d = |u|^γx + |v|^γy
+//     v_G   = opac * v_alpha                      (d(alpha)/d(vis) = opac)
+//     dσ/du = 0.5 * γx * |u|^(γx-1) * sign(u)     (= γx/2 * |u|^(γx-1) * u/|u|)
+//     dσ/dv analogously; pass back through cross-product chain rule.
+//     dσ/dγx = 0.5 * |u|^γx * ln|u|               (zero at |u| < eps to skip the log singularity)
+//     dσ/dγy analogously; atomicAdd into v_gammas[g].
 //
 //   Case 2 — 2D screen falloff active (gauss_3d > gauss_2d):
 //     v_means2d[g] += -vis * FILTER_INV_SQ * d * v_G
@@ -48,6 +51,7 @@ static constexpr float BWD_RASTER_NEAR_PLANE = 0.2f;
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct bwd_f3 { float x, y, z; };
+struct bwd_f2 { float x, y; };
 
 __device__ inline bwd_f3 cross3_b(bwd_f3 a, bwd_f3 b) {
     return { a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x };
@@ -62,6 +66,7 @@ __global__ void rasterize_bwd_kernel(
     const float*   __restrict__ means2d,        // [N, 2]
     const float*   __restrict__ ray_transforms, // [N, 9]
     const float*   __restrict__ opacities,      // [N]  raw logit
+    const float*   __restrict__ gammas,         // [N, 2] raw shape exponents
     const float*   __restrict__ colors,         // [N, 3]
     const float*   __restrict__ normals,        // [N, 3]
     const int32_t* __restrict__ tile_offsets,   // [tile_h * tile_w]
@@ -85,6 +90,7 @@ __global__ void rasterize_bwd_kernel(
     // outputs — zeroed before launch, accumulated via atomicAdd
     float*   __restrict__ v_ray_transforms, // [N, 9]
     float*   __restrict__ v_opacities,      // [N]
+    float*   __restrict__ v_gammas,         // [N, 2]
     float*   __restrict__ v_colors,         // [N, 3]
     float*   __restrict__ v_normals,        // [N, 3]
     float*   __restrict__ v_means2d,        // [N, 2]
@@ -120,8 +126,9 @@ __global__ void rasterize_bwd_kernel(
     bwd_f3*  u_M_batch        = (bwd_f3*)&xy_opacity_batch[block_size];
     bwd_f3*  v_M_batch        = (bwd_f3*)&u_M_batch[block_size];
     bwd_f3*  w_M_batch        = (bwd_f3*)&v_M_batch[block_size];
-    float*   rgb_batch        = (float* )&w_M_batch[block_size]; // [block_size * 3]
-    float*   normal_batch     = rgb_batch + block_size * 3;      // [block_size * 3]
+    bwd_f2*  gamma_batch      = (bwd_f2*)&w_M_batch[block_size];
+    float*   rgb_batch        = (float* )&gamma_batch[block_size]; // [block_size * 3]
+    float*   normal_batch     = rgb_batch + block_size * 3;        // [block_size * 3]
 
     // ── Per-pixel state ───────────────────────────────────────────────────────
     float T_final  = inside ? 1.f - render_alphas[pix_id] : 1.f;
@@ -173,6 +180,8 @@ __global__ void rasterize_bwd_kernel(
             u_M_batch[tr]        = { ray_transforms[g*9],   ray_transforms[g*9+1], ray_transforms[g*9+2] };
             v_M_batch[tr]        = { ray_transforms[g*9+3], ray_transforms[g*9+4], ray_transforms[g*9+5] };
             w_M_batch[tr]        = { ray_transforms[g*9+6], ray_transforms[g*9+7], ray_transforms[g*9+8] };
+            float2 gxy = SplatData::gamma2(gammas + g * 2);
+            gamma_batch[tr]      = { gxy.x, gxy.y };
             rgb_batch[tr*3+0]    = colors[g*3+0];
             rgb_batch[tr*3+1]    = colors[g*3+1];
             rgb_batch[tr*3+2]    = colors[g*3+2];
@@ -205,7 +214,11 @@ __global__ void rasterize_bwd_kernel(
             float u = zeta.x / zeta.z;
             float v = zeta.y / zeta.z;
 
-            float gauss_3d = u*u + v*v;
+            const bwd_f2 gxy = gamma_batch[t];
+            float au = fabsf(u), av = fabsf(v);
+            float pu = __powf(au, gxy.x);   // |u|^γx
+            float pv = __powf(av, gxy.y);   // |v|^γy
+            float gauss_3d = pu + pv;
             float dx = xyo.x - px, dy = xyo.y - py_f;
             float gauss_2d = BWD_FILTER_INV_SQ * (dx*dx + dy*dy);
             bool use_3d = (gauss_3d <= gauss_2d);
@@ -305,13 +318,38 @@ __global__ void rasterize_bwd_kernel(
             float v_w_extra0 = use_3d ? (v_depth * u) : 0.f;
             float v_w_extra1 = use_3d ? (v_depth * v) : 0.f;
             float v_w_extra2 = v_depth;
+            float v_gx = 0.f, v_gy = 0.f;
 
             if (opac * vis <= 0.999f) {
                 if (use_3d) {
-                    // Case 1: 3D kernel — backprop through ray-splat intersection
-                    // vis = exp(-0.5*(u²+v²))   d(vis)/d(u) = -vis*u
-                    v_s_x += v_G * (-vis) * u;
-                    v_s_y += v_G * (-vis) * v;
+                    // Case 1: super-Gaussian kernel
+                    //   sigma   = 0.5 * (|u|^γx + |v|^γy)
+                    //   vis     = exp(-sigma)
+                    //   v_sigma = -vis * v_G   (chain through alpha = opac*vis)
+                    //   dσ/du   = 0.5 * γx * |u|^(γx-1) * sign(u)
+                    //   dσ/dγx  = 0.5 * |u|^γx * ln|u|
+                    // Edge cases: |u| near zero — derivative w.r.t. u is fine for γ>1
+                    // but the log blows up; clamp grad-to-γ to zero there.
+                    const float EPS_GAMMA = 1e-6f;
+                    float v_sigma = -vis * v_G;
+                    float dsig_du = (au > 0.f)
+                        ? 0.5f * gxy.x * __powf(au, gxy.x - 1.f) * (u >= 0.f ? 1.f : -1.f)
+                        : 0.f;
+                    float dsig_dv = (av > 0.f)
+                        ? 0.5f * gxy.y * __powf(av, gxy.y - 1.f) * (v >= 0.f ? 1.f : -1.f)
+                        : 0.f;
+                    v_s_x += v_sigma * dsig_du;
+                    v_s_y += v_sigma * dsig_dv;
+
+                    if (au > EPS_GAMMA) {
+                        // chain through γ = exp(raw)+1: d(γ)/d(raw) = exp(raw) = γ - 1
+                        float dsig_dgx = 0.5f * pu * __logf(au);
+                        v_gx = v_sigma * dsig_dgx * (gxy.x - 1.f);
+                    }
+                    if (av > EPS_GAMMA) {
+                        float dsig_dgy = 0.5f * pv * __logf(av);
+                        v_gy = v_sigma * dsig_dgy * (gxy.y - 1.f);
+                    }
                 } else {
                     // Case 2: 2D screen falloff — gradient goes to means2d
                     float v_G_dx = -vis * BWD_FILTER_INV_SQ * dx;
@@ -354,6 +392,8 @@ __global__ void rasterize_bwd_kernel(
             atomicAdd(&v_ray_transforms[g*9+7], v_wM1);
             atomicAdd(&v_ray_transforms[g*9+8], v_wM2);
             atomicAdd(&v_opacities[g],          v_raw_opacity);
+            if (v_gx != 0.f) atomicAdd(&v_gammas[g*2+0], v_gx);
+            if (v_gy != 0.f) atomicAdd(&v_gammas[g*2+1], v_gy);
             atomicAdd(&v_colors[g*3+0],         v_c_r);
             atomicAdd(&v_colors[g*3+1],         v_c_g);
             atomicAdd(&v_colors[g*3+2],         v_c_b);
@@ -378,6 +418,7 @@ void launch_rasterize_bwd(
     const float*   d_means2d,
     const float*   d_ray_transforms,
     const float*   d_opacities,
+    const float*   d_gammas,
     const float*   d_colors,
     const float*   d_normals,
     const int32_t* d_tile_offsets,
@@ -395,6 +436,7 @@ void launch_rasterize_bwd(
     uint32_t image_height,
     float*   d_v_ray_transforms,
     float*   d_v_opacities,
+    float*   d_v_gammas,
     float*   d_v_colors,
     float*   d_v_normals,
     float*   d_v_means2d,
@@ -406,16 +448,16 @@ void launch_rasterize_bwd(
     dim3 grid(tile_height, tile_width);
     dim3 block(16u, 16u);
 
-    size_t smem = 256u * (sizeof(int32_t) + sizeof(bwd_f3)*4u + sizeof(float)*6u);
+    size_t smem = 256u * (sizeof(int32_t) + sizeof(bwd_f3)*4u + sizeof(bwd_f2) + sizeof(float)*6u);
 
     rasterize_bwd_kernel<<<grid, block, smem>>>(
-        d_means2d, d_ray_transforms, d_opacities, d_colors, d_normals,
+        d_means2d, d_ray_transforms, d_opacities, d_gammas, d_colors, d_normals,
         d_tile_offsets, d_flatten_ids, n_isects,
         d_render_alphas, d_render_depth_accum, d_last_ids,
         d_v_render_colors, d_v_render_alphas, d_v_render_normals,
         d_v_render_depth_accum, d_v_render_distort,
         image_width, image_height, tile_width, tile_height,
-        d_v_ray_transforms, d_v_opacities, d_v_colors, d_v_normals,
+        d_v_ray_transforms, d_v_opacities, d_v_gammas, d_v_colors, d_v_normals,
         d_v_means2d, d_v_means2d_abs
     );
     CUDA_CHECK(cudaGetLastError());

@@ -73,6 +73,7 @@ struct HostSplatState {
     std::vector<float> rotation;
     std::vector<float> scaling;
     std::vector<float> opacity;
+    std::vector<float> gamma;
     std::vector<float> sh0;
     std::vector<float> shN;
 };
@@ -85,6 +86,7 @@ static HostSplatState download_splats(const SplatData& splats) {
     host.rotation.resize(N * 4);
     host.scaling.resize(N * 3);
     host.opacity.resize(N);
+    host.gamma.resize(N * 2);
     host.sh0.resize(N * 3);
     host.shN.resize(N * shn_dim);
 
@@ -97,6 +99,8 @@ static HostSplatState download_splats(const SplatData& splats) {
                               N * 3 * sizeof(float), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(host.opacity.data(), splats.opacity(),
                               N * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(host.gamma.data(), splats.gamma(),
+                              N * 2 * sizeof(float), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(host.sh0.data(), splats.sh0(),
                               N * 3 * sizeof(float), cudaMemcpyDeviceToHost));
         if (shn_dim > 0) {
@@ -121,6 +125,8 @@ static void upload_splats(SplatData& splats, const HostSplatState& host) {
                           N * 3 * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(splats.opacity(), host.opacity.data(),
                           N * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(splats.gamma(), host.gamma.data(),
+                          N * 2 * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(splats.sh0(), host.sh0.data(),
                           N * 3 * sizeof(float), cudaMemcpyHostToDevice));
     if (shn_dim > 0 && !host.shN.empty()) {
@@ -294,6 +300,7 @@ static bool maybe_densify(
     next.rotation.resize(new_N * 4);
     next.scaling.resize(new_N * 3);
     next.opacity.resize(new_N);
+    next.gamma.resize(new_N * 2);
     next.sh0.resize(new_N * 3);
     next.shN.resize(new_N * shn_dim);
 
@@ -308,6 +315,7 @@ static bool maybe_densify(
         std::copy_n(host.rotation.data() + src_row * 4, 4, next.rotation.data() + dst_row * 4);
         std::copy_n(host.scaling.data() + src_row * 3, 3, next.scaling.data() + dst_row * 3);
         next.opacity[dst_row] = host.opacity[src_row];
+        std::copy_n(host.gamma.data() + src_row * 2, 2, next.gamma.data() + dst_row * 2);
         std::copy_n(host.sh0.data() + src_row * 3, 3, next.sh0.data() + dst_row * 3);
         if (shn_dim > 0)
             std::copy_n(host.shN.data() + src_row * shn_dim, shn_dim,

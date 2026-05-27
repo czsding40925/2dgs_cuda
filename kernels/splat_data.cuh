@@ -20,6 +20,7 @@
 //   rotation    [N, 4]   float32   quaternions (w, x, y, z), raw unnormalized
 //   scaling     [N, 3]   float32   log-scale per axis
 //   opacity     [N]      float32   logit opacity
+//   gamma       [N, 2]   float32   raw shape exponents; γ = exp(gamma_raw)+1, γ=2 ⇔ raw=0
 //   sh0         [N, 3]   float32   degree-0 SH (base RGB color)
 //   shN         [N, K]   float32   degree 1-3 SH, K = 3*(sh_degree^2+2*sh_degree)
 //
@@ -116,6 +117,7 @@ public:
     float* rotation() { return _rotation; } // [N, 4]  raw, unnormalized
     float* scaling()  { return _scaling; }  // [N, 3]  log-scale
     float* opacity()  { return _opacity; }  // [N]     logit
+    float* gamma()    { return _gamma; }    // [N, 2]  raw shape; γ = exp(raw)+1
     float* sh0()      { return _sh0; }      // [N, 3]  DC color
     float* shN()      { return _shN; }      // [N, K]  higher-order SH (nullptr if degree 0)
 
@@ -123,6 +125,7 @@ public:
     const float* rotation() const { return _rotation; }
     const float* scaling()  const { return _scaling; }
     const float* opacity()  const { return _opacity; }
+    const float* gamma()    const { return _gamma; }
     const float* sh0()      const { return _sh0; }
     const float* shN()      const { return _shN; }
 
@@ -143,6 +146,11 @@ public:
     __device__ static float4 normalize4(const float* q) {
         float inv = rsqrtf(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
         return make_float4(q[0]*inv, q[1]*inv, q[2]*inv, q[3]*inv);
+    }
+
+    // γ = exp(raw) + 1   →   raw = 0 gives γ = 2 (Gaussian)
+    __device__ static float2 gamma2(const float* g) {
+        return make_float2(__expf(g[0]) + 1.f, __expf(g[1]) + 1.f);
     }
 
     // ── Capacity management (for densification) ───────────────────────────────
@@ -230,6 +238,14 @@ public:
         CUDA_CHECK(cudaMemcpy(_scaling,  h_scaling.data(),  M*3*sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(_opacity,  h_opacity.data(),  M  *sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(_sh0,      h_sh0.data(),      M*3*sizeof(float), cudaMemcpyHostToDevice));
+        // gamma init follows nexels: raw=-5  →  γ = exp(-5)+1 ≈ 1.0067 (Laplace-like spike).
+        // Densification clones inherit this through the host-side copy; keep raw < 0 here
+        // so that even on a fresh start the kernel begins exploring sub-Gaussian falloffs.
+        {
+            std::vector<float> h_gamma(M * 2, -5.0f);
+            CUDA_CHECK(cudaMemcpy(_gamma, h_gamma.data(), M * 2 * sizeof(float),
+                                  cudaMemcpyHostToDevice));
+        }
         // shN starts at zero — SH curriculum increases active_sh_degree during training
         if (_shN) {
             int K_sh = sh_coeffs_per_channel(_max_sh_degree) * 3;
@@ -322,6 +338,13 @@ public:
             if (it != prop_offset.end()) off_frest[k] = it->second;
         }
 
+        // gamma (optional — old PLYs default to γ=2, i.e. raw=0)
+        int off_gamma0 = -1, off_gamma1 = -1;
+        auto it_g0 = prop_offset.find("gamma_0");
+        auto it_g1 = prop_offset.find("gamma_1");
+        if (it_g0 != prop_offset.end()) off_gamma0 = it_g0->second;
+        if (it_g1 != prop_offset.end()) off_gamma1 = it_g1->second;
+
         // ── Read all vertex data ──────────────────────────────────────────────
         std::vector<uint8_t> buf((size_t)n_vertices * vertex_stride);
         f.read(reinterpret_cast<char*>(buf.data()), buf.size());
@@ -331,7 +354,7 @@ public:
         // ── Unpack into host arrays ───────────────────────────────────────────
         const int N = n_vertices;
         std::vector<float> h_means(N*3), h_rotation(N*4), h_scaling(N*3),
-                           h_opacity(N), h_sh0(N*3);
+                           h_opacity(N), h_sh0(N*3), h_gamma(N*2, 0.f);
 
         int K_shN = sh_coeffs_per_channel(max_sh_degree) * 3;
         std::vector<float> h_shN(N * K_shN, 0.f);
@@ -365,6 +388,9 @@ public:
             for (int k = 0; k < K_shN; k++)
                 if (off_frest[k] >= 0)
                     h_shN[i * K_shN + k] = rd(v, off_frest[k]);
+
+            if (off_gamma0 >= 0) h_gamma[i*2+0] = rd(v, off_gamma0);
+            if (off_gamma1 >= 0) h_gamma[i*2+1] = rd(v, off_gamma1);
         }
 
         // ── Upload to GPU ─────────────────────────────────────────────────────
@@ -375,6 +401,7 @@ public:
         CUDA_CHECK(cudaMemcpy(_rotation, h_rotation.data(), N*4*sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(_scaling,  h_scaling.data(),  N*3*sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(_opacity,  h_opacity.data(),  N  *sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(_gamma,    h_gamma.data(),    N*2*sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(_sh0,      h_sh0.data(),      N*3*sizeof(float), cudaMemcpyHostToDevice));
         if (_shN && K_shN > 0)
             CUDA_CHECK(cudaMemcpy(_shN, h_shN.data(), N*K_shN*sizeof(float), cudaMemcpyHostToDevice));
@@ -398,7 +425,7 @@ public:
         const int K_shN = sh_coeffs_per_channel(_max_sh_degree) * 3;
 
         std::vector<float> h_means(N * 3), h_rotation(N * 4), h_scaling(N * 3),
-                           h_opacity(N), h_sh0(N * 3);
+                           h_opacity(N), h_sh0(N * 3), h_gamma(N * 2);
         std::vector<float> h_shN;
         if (K_shN > 0)
             h_shN.resize((size_t)N * K_shN);
@@ -407,6 +434,7 @@ public:
         CUDA_CHECK(cudaMemcpy(h_rotation.data(), _rotation, N * 4 * sizeof(float), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(h_scaling.data(), _scaling, N * 3 * sizeof(float), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(h_opacity.data(), _opacity, N * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_gamma.data(), _gamma, N * 2 * sizeof(float), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(h_sh0.data(), _sh0, N * 3 * sizeof(float), cudaMemcpyDeviceToHost));
         if (K_shN > 0 && _shN)
             CUDA_CHECK(cudaMemcpy(h_shN.data(), _shN, (size_t)N * K_shN * sizeof(float), cudaMemcpyDeviceToHost));
@@ -437,6 +465,8 @@ public:
         f << "property float rot_1\n";
         f << "property float rot_2\n";
         f << "property float rot_3\n";
+        f << "property float gamma_0\n";
+        f << "property float gamma_1\n";
         f << "end_header\n";
 
         auto wr = [&](float v) {
@@ -469,6 +499,9 @@ public:
             wr(h_rotation[i * 4 + 1]);
             wr(h_rotation[i * 4 + 2]);
             wr(h_rotation[i * 4 + 3]);
+
+            wr(h_gamma[i * 2 + 0]);
+            wr(h_gamma[i * 2 + 1]);
         }
 
         if (!f.good())
@@ -490,6 +523,7 @@ private:
     float* _rotation = nullptr;
     float* _scaling  = nullptr;
     float* _opacity  = nullptr;
+    float* _gamma    = nullptr;   // [N, 2]  raw; γ = exp(raw)+1
     float* _sh0      = nullptr;
     float* _shN      = nullptr;   // nullptr when max_sh_degree == 0
 
@@ -511,6 +545,7 @@ private:
         CUDA_CHECK(cudaMalloc(&_rotation, N * 4 * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&_scaling,  N * 3 * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&_opacity,  N     * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&_gamma,    N * 2 * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&_sh0,      N * 3 * sizeof(float)));
 
         int K = sh_coeffs_per_channel(max_sh_degree);
@@ -523,6 +558,7 @@ private:
         cudaFree(_rotation); _rotation = nullptr;
         cudaFree(_scaling);  _scaling  = nullptr;
         cudaFree(_opacity);  _opacity  = nullptr;
+        cudaFree(_gamma);    _gamma    = nullptr;
         cudaFree(_sh0);      _sh0      = nullptr;
         cudaFree(_shN);      _shN      = nullptr;
         _N = 0;
@@ -534,6 +570,7 @@ private:
         _rotation = o._rotation; o._rotation = nullptr;
         _scaling  = o._scaling;  o._scaling  = nullptr;
         _opacity  = o._opacity;  o._opacity  = nullptr;
+        _gamma    = o._gamma;    o._gamma    = nullptr;
         _sh0      = o._sh0;      o._sh0      = nullptr;
         _shN      = o._shN;      o._shN      = nullptr;
         _N              = o._N;              o._N              = 0;
@@ -550,6 +587,7 @@ inline void SplatData::reserve(int new_capacity) {
     float* new_rotation = nullptr;
     float* new_scaling = nullptr;
     float* new_opacity = nullptr;
+    float* new_gamma = nullptr;
     float* new_sh0 = nullptr;
     float* new_shN = nullptr;
 
@@ -557,6 +595,7 @@ inline void SplatData::reserve(int new_capacity) {
     CUDA_CHECK(cudaMalloc(&new_rotation, new_capacity * 4 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&new_scaling,  new_capacity * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&new_opacity,  new_capacity     * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&new_gamma,    new_capacity * 2 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&new_sh0,      new_capacity * 3 * sizeof(float)));
 
     int K = sh_coeffs_per_channel(_max_sh_degree);
@@ -568,6 +607,7 @@ inline void SplatData::reserve(int new_capacity) {
         CUDA_CHECK(cudaMemcpy(new_rotation, _rotation, _N * 4 * sizeof(float), cudaMemcpyDeviceToDevice));
         CUDA_CHECK(cudaMemcpy(new_scaling, _scaling, _N * 3 * sizeof(float), cudaMemcpyDeviceToDevice));
         CUDA_CHECK(cudaMemcpy(new_opacity, _opacity, _N * sizeof(float), cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(new_gamma, _gamma, _N * 2 * sizeof(float), cudaMemcpyDeviceToDevice));
         CUDA_CHECK(cudaMemcpy(new_sh0, _sh0, _N * 3 * sizeof(float), cudaMemcpyDeviceToDevice));
         if (new_shN && _shN)
             CUDA_CHECK(cudaMemcpy(new_shN, _shN, _N * K * 3 * sizeof(float), cudaMemcpyDeviceToDevice));
@@ -577,6 +617,7 @@ inline void SplatData::reserve(int new_capacity) {
     cudaFree(_rotation);
     cudaFree(_scaling);
     cudaFree(_opacity);
+    cudaFree(_gamma);
     cudaFree(_sh0);
     cudaFree(_shN);
 
@@ -584,6 +625,7 @@ inline void SplatData::reserve(int new_capacity) {
     _rotation = new_rotation;
     _scaling = new_scaling;
     _opacity = new_opacity;
+    _gamma = new_gamma;
     _sh0 = new_sh0;
     _shN = new_shN;
     _capacity = new_capacity;

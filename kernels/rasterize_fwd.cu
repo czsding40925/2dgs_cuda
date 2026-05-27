@@ -37,6 +37,10 @@
 //   render_normals     [H, W, 3]  — accumulated camera-space normals (optional)
 //   render_depth_accum [H, W]     — accumulated expected-depth numerator Σ vis·depth (optional)
 //   render_distort     [H, W]     — per-pixel depth distortion regularizer (optional)
+//   render_median      [H, W]     — depth of the splat at which transmittance T
+//                                    first crosses 0.5 (optional). Non-differentiable;
+//                                    used in the geometry-loss path to mix with the
+//                                    expected depth via `depth_ratio`.
 //   last_ids           [H, W]     — index in sorted list of last contributing Gaussian
 //                                    (needed by backward pass to replay in reverse)
 
@@ -64,6 +68,7 @@ static constexpr float    RASTER_NEAR_PLANE = 0.2f;
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct float3_s { float x, y, z; };
+struct float2_s { float x, y; };
 
 __device__ inline float3_s cross3(float3_s a, float3_s b) {
     return { a.y*b.z - a.z*b.y,
@@ -80,6 +85,7 @@ __global__ void rasterize_fwd_kernel(
     const float*   __restrict__ means2d,       // [N, 2]   pixel-space centers
     const float*   __restrict__ ray_transforms, // [N, 9]   u_M, v_M, w_M rows
     const float*   __restrict__ opacities,     // [N]      raw logit, sigmoid applied here
+    const float*   __restrict__ gammas,        // [N, 2]   raw shape; γ = exp(raw)+1
     // appearance
     const float*   __restrict__ colors,        // [N, 3]   pre-evaluated RGB in [0,1]
     const float*   __restrict__ normals,       // [N, 3]   camera-space normals
@@ -98,6 +104,7 @@ __global__ void rasterize_fwd_kernel(
     float*   __restrict__ render_normals, // [H, W, 3] or nullptr
     float*   __restrict__ render_depth_accum, // [H, W] or nullptr
     float*   __restrict__ render_distort, // [H, W] or nullptr
+    float*   __restrict__ render_median,  // [H, W] or nullptr
     int32_t* __restrict__ last_ids        // [H, W]
 ) {
     auto block = cg::this_thread_block();
@@ -133,6 +140,7 @@ __global__ void rasterize_fwd_kernel(
     float3_s* u_M_batch        = (float3_s*)&xy_opacity_batch[block_size];
     float3_s* v_M_batch        = (float3_s*)&u_M_batch[block_size];
     float3_s* w_M_batch        = (float3_s*)&v_M_batch[block_size];
+    float2_s* gamma_batch      = (float2_s*)&w_M_batch[block_size];
 
     // ── Per-pixel state ───────────────────────────────────────────────────────
     float T        = 1.0f;
@@ -141,6 +149,9 @@ __global__ void rasterize_fwd_kernel(
     float pix_depth = 0.f;
     float distort   = 0.f;
     float accum_vis_depth = 0.f;
+    // Median depth: depth of the splat that first pushes transmittance T below
+    // 0.5. Stays at 0 for pixels whose composite never reaches that point.
+    float median_depth = 0.f;
     int32_t cur_idx = -1;
     uint32_t tr    = block.thread_rank();
 
@@ -165,6 +176,8 @@ __global__ void rasterize_fwd_kernel(
             u_M_batch[tr] = { ray_transforms[g*9],   ray_transforms[g*9+1], ray_transforms[g*9+2] };
             v_M_batch[tr] = { ray_transforms[g*9+3], ray_transforms[g*9+4], ray_transforms[g*9+5] };
             w_M_batch[tr] = { ray_transforms[g*9+6], ray_transforms[g*9+7], ray_transforms[g*9+8] };
+            float2 gxy = SplatData::gamma2(gammas + g * 2);
+            gamma_batch[tr] = { gxy.x, gxy.y };
         }
         block.sync();
 
@@ -189,8 +202,10 @@ __global__ void rasterize_fwd_kernel(
             float u = zeta.x / zeta.z;
             float v = zeta.y / zeta.z;
 
-            // Merge 3D Gaussian kernel with 2D screen falloff (anti-aliasing)
-            float gauss_3d = u*u + v*v;
+            // Merge 3D Gaussian kernel with 2D screen falloff (anti-aliasing).
+            // Generalized super-Gaussian: γ=2 reduces to u²+v² (standard Gaussian).
+            const float2_s gxy = gamma_batch[t];
+            float gauss_3d = __powf(fabsf(u), gxy.x) + __powf(fabsf(v), gxy.y);
             float dx = xyo.x - px, dy = xyo.y - py_f;
             float gauss_2d = FILTER_INV_SQ * (dx*dx + dy*dy);
             float sigma = 0.5f * fminf(gauss_3d, gauss_2d);
@@ -228,6 +243,10 @@ __global__ void rasterize_fwd_kernel(
                 distort += 2.f * (vis * depth * (1.f - T) - vis * accum_vis_depth);
                 accum_vis_depth += vis * depth;
             }
+            // Median depth tracking: record the depth of the splat that first
+            // takes T from above 0.5 to at-or-below 0.5. Single update per pixel.
+            if (render_median != nullptr && T > 0.5f && next_T <= 0.5f)
+                median_depth = depth;
 
             cur_idx = batch_start + t;
             T = next_T;
@@ -250,6 +269,8 @@ __global__ void rasterize_fwd_kernel(
             render_depth_accum[pix_id] = pix_depth;
         if (render_distort != nullptr)
             render_distort[pix_id] = distort;
+        if (render_median != nullptr)
+            render_median[pix_id] = median_depth;
         last_ids[pix_id]          = cur_idx;
     }
 }
@@ -262,6 +283,7 @@ void launch_rasterize_fwd(
     const float*   d_means2d,
     const float*   d_ray_transforms,
     const float*   d_opacities,
+    const float*   d_gammas,
     const float*   d_colors,
     const float*   d_normals,
     const int32_t* d_tile_offsets,
@@ -275,6 +297,7 @@ void launch_rasterize_fwd(
     float*   d_render_normals,
     float*   d_render_depth_accum,
     float*   d_render_distort,
+    float*   d_render_median,
     int32_t* d_last_ids
 ) {
     uint32_t tile_width  = (image_width  + TILE_SIZE - 1) / TILE_SIZE;
@@ -289,15 +312,16 @@ void launch_rasterize_fwd(
         sizeof(float3_s) +  // xy_opacity_batch
         sizeof(float3_s) +  // u_M_batch
         sizeof(float3_s) +  // v_M_batch
-        sizeof(float3_s)    // w_M_batch
+        sizeof(float3_s) +  // w_M_batch
+        sizeof(float2_s)    // gamma_batch
     );
 
     rasterize_fwd_kernel<<<grid, block, smem>>>(
-        d_means2d, d_ray_transforms, d_opacities, d_colors, d_normals,
+        d_means2d, d_ray_transforms, d_opacities, d_gammas, d_colors, d_normals,
         d_tile_offsets, d_flatten_ids, n_isects,
         image_width, image_height, tile_width, tile_height,
         d_render_colors, d_render_alphas, d_render_normals,
-        d_render_depth_accum, d_render_distort, d_last_ids
+        d_render_depth_accum, d_render_distort, d_render_median, d_last_ids
     );
     CUDA_CHECK(cudaGetLastError());
 }
@@ -359,7 +383,7 @@ int main() {
 
     // ── GPU allocations ───────────────────────────────────────────────────────
     float   *d_means, *d_rotation, *d_scaling, *d_viewmat;
-    float   *d_colors, *d_opacities;
+    float   *d_colors, *d_opacities, *d_gammas;
     float   *d_ray_transforms, *d_means2d, *d_depths, *d_normals;
     int32_t *d_radii;
     CUDA_CHECK(cudaMalloc(&d_means,          N*3*sizeof(float)));
@@ -368,6 +392,8 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_viewmat,        16*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_colors,         N*3*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_opacities,      N*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_gammas,         N*2*sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_gammas, 0,       N*2*sizeof(float))); // raw=0 → γ=2
     CUDA_CHECK(cudaMalloc(&d_ray_transforms, N*9*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_means2d,        N*2*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_radii,          N*2*sizeof(int32_t)));
@@ -455,10 +481,10 @@ int main() {
     CUDA_CHECK(cudaMemset(d_render_alphas, 0, H*W*sizeof(float)));
 
     launch_rasterize_fwd(
-        d_means2d, d_ray_transforms, d_opacities, d_colors, d_normals,
+        d_means2d, d_ray_transforms, d_opacities, d_gammas, d_colors, d_normals,
         d_tile_offsets, d_flatten_ids_sorted, n_isects,
         W, H, d_render_colors, d_render_alphas,
-        nullptr, nullptr, nullptr, d_last_ids
+        nullptr, nullptr, nullptr, nullptr, d_last_ids
     );
 
     // ── Sample pixels at expected Gaussian centers ────────────────────────────
@@ -482,7 +508,7 @@ int main() {
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
     cudaFree(d_means); cudaFree(d_rotation); cudaFree(d_scaling); cudaFree(d_viewmat);
-    cudaFree(d_colors); cudaFree(d_opacities);
+    cudaFree(d_colors); cudaFree(d_opacities); cudaFree(d_gammas);
     cudaFree(d_ray_transforms); cudaFree(d_means2d); cudaFree(d_radii);
     cudaFree(d_depths); cudaFree(d_normals);
     cudaFree(d_tiles_per_gauss); cudaFree(d_cum_tiles);
